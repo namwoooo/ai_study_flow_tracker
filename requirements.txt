@@ -1,0 +1,7 @@
+transformers
+accelerate
+sentencepiece
+bitsandbytes
+torch
+pandas
+matplotlib
