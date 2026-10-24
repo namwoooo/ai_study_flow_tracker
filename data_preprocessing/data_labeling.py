@@ -1,12 +1,3 @@
-"""
-Converted from a Jupyter Notebook to a Python-style file.
-
-Formatting-only conversion: markdown cells are comments and cell boundaries
-are marked with # %% . Code cell contents are preserved as provided.
-Notebook-specific commands may need adjustment before running as a .py file.
-"""
-
-# %% [markdown]
 # # feature 추가
 
 # %%
