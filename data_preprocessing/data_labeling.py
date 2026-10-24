@@ -1,1931 +1,1191 @@
-{
-  "nbformat": 4,
-  "nbformat_minor": 0,
-  "metadata": {
-    "colab": {
-      "provenance": [],
-      "collapsed_sections": [
-        "a3u7l_VviImX",
-        "qX-7hcQAZF9g",
-        "i-yO1VzPgYQ9"
-      ]
-    },
-    "kernelspec": {
-      "name": "python3",
-      "display_name": "Python 3"
-    },
-    "language_info": {
-      "name": "python"
-    }
-  },
-  "cells": [
-    {
-      "cell_type": "markdown",
-      "source": [
-        "# feature 추가"
-      ],
-      "metadata": {
-        "id": "a3u7l_VviImX"
+# # feature 추가
+
+# %%
+from google.colab import drive
+drive.mount('/content/drive')
+
+# %%
+!pip install mediapipe
+
+# =========================
+# 1) 라이브러리 임포트
+# =========================
+import os
+import cv2
+import numpy as np #파일 경로, 영상처리, 수치연산 사용 import
+from moviepy.editor import VideoFileClip #동영상에서 특정 시각 프레임을 뽑아오기 위해 moviePy 사용
+import mediapipe as mp # 얼굴 눈 몸 랜드마크 검출
+import pandas as pd
+
+# %%
+# --- EAR에 쓸 MediaPipe FaceMesh 눈 랜드마크 인덱스(6 points) ---
+# (자주 쓰이는 조합. 왼/오른쪽 각각 p1..p6 순서)
+LEFT_EYE_IDXS  = [33, 160, 158, 133, 153, 144]   # p1,p2,p3,p4,p5,p6
+RIGHT_EYE_IDXS = [362, 385, 387, 263, 373, 380]  # p1,p2,p3,p4,p5,p6
+
+def eye_aspect_ratio_6pts(eye6): #입력된 6점으로 ear 계산
+  # eye6: np.array shape (6,2) in pixel coords
+  p1,p2,p3,p4,p5,p6 = eye6
+  vert = np.linalg.norm(p2-p6) + np.linalg.norm(p3-p5)
+  horiz = 2.0*np.linalg.norm(p1-p4) + 1e-8
+  return float(vert / horiz)
+
+def time_decay_weights(T, lam=0.08):
+  # 세그먼트 내부 최근 프레임에 더 큰 가중치를 주는 지수 감쇠 가중치 w 생성, 인덱스가 뒤로 갈수록 (최근으로 갈 수록 값이 큼)
+  idx = np.arange(T)
+  w = np.exp(-lam * (T - 1 - idx))
+  return w / w.sum()
+
+def to_score(x, lo, hi, small_is_good=True): #어떤 원시값 x를 [low, high]으로 클리핑 후 0~1 점수화
+  x = np.clip(x, lo, hi)
+  if small_is_good:
+    return 1.0 - (x - lo) / (hi - lo + 1e-8)
+  else:
+    return (x - lo) / (hi - lo + 1e-8)
+
+def l2_norm(a, b): #두 벡터 간 L2 (유클리드) 거리
+  return np.linalg.norm(a - b, ord=2)
+
+# 논문식 통합 눈감음값→집중도 (세그먼트 단위)
+def paper_gaze_score_from_ears(ear_L_series, ear_R_series, ear_thresh=0.21,
+                               ec_clip=(1e-3, 0.9), conc_minmax=(1.0, 10.0)):
+  # 유효 프레임(눈 랜드마크 성공)만 집계
+  L_valid = np.isfinite(ear_L_series)
+  R_valid = np.isfinite(ear_R_series)
+  c_l = L_valid.mean() if L_valid.size else 0.0 #유효 프레임 (신뢰도)
+  c_r = R_valid.mean() if R_valid.size else 0.0 #유효 프레임 (신뢰도)
+
+  if c_l + c_r <= 0:
+    return 0.5  # 정보 부족시 중립
+
+  # 닫힘 비율 e_l, e_r
+  e_l = (ear_L_series[L_valid] < ear_thresh).mean() if c_l > 0 else np.nan
+  e_r = (ear_R_series[R_valid] < ear_thresh).mean() if c_r > 0 else np.nan
+  e_l = 0.0 if np.isnan(e_l) else float(e_l)
+  e_r = 0.0 if np.isnan(e_r) else float(e_r)
+
+  e_c = (c_l*e_l + c_r*e_r) / (c_l + c_r) #통합 눈 감음 값
+  e_c = float(np.clip(e_c, ec_clip[0], ec_clip[1]))  # 폭주 방지
+  conc_raw = 1.0 / e_c #집중도 원시값 (닫힘 적을수록 큼)
+
+  mn, mx = conc_minmax #min-max 정규화 후 0~1로 반환
+  conc_norm = (conc_raw - mn) / (mx - mn + 1e-8)
+  return float(np.clip(conc_norm, 0.0, 1.0))
+
+# =========================
+# 2) 영상 경로 & 파라미터
+# =========================
+from google.colab import drive
+drive.mount('/content/drive')
+
+video_path = "/content/drive/MyDrive/videos/video_data1_kimnamwoo.mp4"
+target_fps   = 10            # 샘플링 fps (초당 10 프레임으로 균일 샘플링)
+segment_sec  = 5             # 세그먼트 길이(초), 세그먼트 길이를 5초 = 50프레임으로 설정
+segment_size = target_fps * segment_sec
+model_input_size = (224, 224)  # ViT 입력 크기, 얼굴 crop을 모델 입력 크기로 리사이즈
+
+if not os.path.exists(video_path):
+  raise FileNotFoundError(f"{video_path} 존재하지 않음")
+
+# =========================
+# 3) MediaPipe 초기화 (video용)
+# =========================
+mp_face = mp.solutions.face_mesh.FaceMesh(
+  static_image_mode=False,          # 영상 처리 → False 권장, 비디오 모드로 FaceMesh 초기화(연속 프레임 추적 안정, 홍채/정교화 사용).
+  max_num_faces=1,
+  refine_landmarks=True             # iris/정교화
+)
+mp_pose = mp.solutions.pose.Pose(     #pose도 비디오 모드로 초기화
+  static_image_mode=False
+)
+
+# =========================
+# 4) 영상 읽고 프레임 샘플링 + 얼굴 crop + 정규화 + 눈/EAR + Pose
+# =========================
+clip = VideoFileClip(video_path)
+duration = clip.duration
+num_frames = int(duration * target_fps)
+
+processed_frames = []     # 모델 입력용 face crop (정규화)
+face_bboxes = []          # (x1,y1,x2,y2) or None, 얼굴 바운딩 박스
+eyes_landmarks = []       # (eyeL(6,2), eyeR(6,2)) or None
+pose_keypoints = []       # (33*3,) float list
+
+for t_idx in range(num_frames):
+  t_sec = t_idx / target_fps
+  frame_rgb = clip.get_frame(t_sec)                 # RGB
+  frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+  h, w, _ = frame_bgr.shape
+
+  # --- FaceMesh
+  res_face = mp_face.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+
+  bbox = None
+  eye_pair = None
+  if res_face.multi_face_landmarks:
+    lm = res_face.multi_face_landmarks[0].landmark
+    x_coords = np.array([p.x for p in lm]); y_coords = np.array([p.y for p in lm])
+    xmin, xmax = int(x_coords.min()*w), int(x_coords.max()*w)
+    ymin, ymax = int(y_coords.min()*h), int(y_coords.max()*h)
+    # bbox clip
+    xmin, ymin = max(0, xmin), max(0, ymin)
+    xmax, ymax = min(w-1, xmax), min(h-1, ymax)
+    if xmax > xmin and ymax > ymin:
+      bbox = (xmin, ymin, xmax, ymax)
+      face_crop = frame_bgr[ymin:ymax, xmin:xmax]
+      if face_crop.size > 0:
+        face_crop_resized = cv2.resize(face_crop, model_input_size)
+        face_crop_norm = (face_crop_resized.astype(np.float32)/127.5) - 1.0
+        processed_frames.append(face_crop_norm)
+      else:
+        # 얼굴 실패 시 프레임 스킵
+        continue
+    else:
+      continue
+
+    # EAR용 눈 6점씩 픽셀좌표 뽑기
+    lm_np = np.array([[p.x*w, p.y*h] for p in lm], dtype=np.float32)
+    try:
+      eyeL = lm_np[LEFT_EYE_IDXS, :]
+      eyeR = lm_np[RIGHT_EYE_IDXS, :]
+      eye_pair = (eyeL, eyeR)
+    except Exception:
+      eye_pair = None
+  else:
+    # 얼굴 없으면 이 프레임 전체를 건너뜀(세그먼트 정합을 위해 skip)
+    continue
+
+  # --- Pose
+  res_pose = mp_pose.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+  if res_pose.pose_landmarks:
+    vec = []
+    for lm_p in res_pose.pose_landmarks.landmark:
+      vec.extend([lm_p.x, lm_p.y, lm_p.z])
+    pose_keypoints.append(vec)
+  else:
+    pose_keypoints.append([0.0]*(33*3))
+
+  # 저장(얼굴이 있었던 프레임만 append했으므로 길이 정합 ok)
+  face_bboxes.append(bbox)
+  eyes_landmarks.append(eye_pair)
+
+processed_frames = np.array(processed_frames)
+pose_keypoints = np.array(pose_keypoints, dtype=np.float32)
+
+print("샘플링 + 전처리 완료:", processed_frames.shape)
+print("Pose keypoints shape:", pose_keypoints.shape)
+
+# =========================
+# 5) 세그먼트 점수 계산 (논문식 시선 + 기존 안정성 + 자세)
+# =========================
+def compute_segment_scores(processed_frames, pose_keypoints, eyes_landmarks,
+                           segment_size,
+                           params=None):
+  T = len(processed_frames)
+  num_segments = T // segment_size
+  results = []
+
+  P = {
+    'ear_thresh': 0.21,
+    'gaze_change_norm': (0.0, 0.50),   # 작을수록 좋음
+    'pose_l2_norm':     (0.0, 0.30),   # 작을수록 좋음
+    'time_decay_lambda': 0.08,         # 세그먼트 내부 프레임 가중
+    'gaze_mix': {'paper': 0.7, 'stability': 0.3},  # 논문식 vs 기존 프록시 가중
+    'ec_clip': (1e-3, 0.9),
+    'conc_minmax': (1.0, 10.0)
+  }
+  if params: P.update(params)
+
+  for seg_idx in range(num_segments):
+    s = seg_idx * segment_size
+    e = s + segment_size
+    w = time_decay_weights(segment_size, lam=P['time_decay_lambda'])
+
+    # --- 5.1 기존 gaze stability (RGB mean 프록시)
+    gx = processed_frames[s:e].reshape(segment_size, -1).mean(axis=1)
+    gdiff = np.abs(np.diff(gx))
+    gaze_change = float(np.average(gdiff, weights=w[1:]))
+    gaze_stability_score = to_score(gaze_change, *P['gaze_change_norm'], small_is_good=True)
+
+    # --- 5.2 논문식 gaze (EAR → e_l, e_r → e_c → 1/e_c)
+    ear_L = []
+    ear_R = []
+    for t in range(s, e):
+      eyes = eyes_landmarks[t]
+      if eyes is None:
+        ear_L.append(np.nan); ear_R.append(np.nan)
+        continue
+      eyeL, eyeR = eyes
+      try:
+        ear_L.append(eye_aspect_ratio_6pts(eyeL))
+        ear_R.append(eye_aspect_ratio_6pts(eyeR))
+      except Exception:
+        ear_L.append(np.nan); ear_R.append(np.nan)
+    ear_L = np.array(ear_L, dtype=np.float32)
+    ear_R = np.array(ear_R, dtype=np.float32)
+    gaze_paper_score = paper_gaze_score_from_ears(
+      ear_L, ear_R,
+      ear_thresh=P['ear_thresh'],
+      ec_clip=P['ec_clip'],
+      conc_minmax=P['conc_minmax']
+    )
+    gaze_score = P['gaze_mix']['paper']*gaze_paper_score + P['gaze_mix']['stability']*gaze_stability_score
+
+    # --- 5.3 Pose stability (프레임간 키포인트 L2, 작을수록 좋음)
+    pose_changes = []
+    for t in range(s+1, e):
+      v_t   = pose_keypoints[t]
+      v_tm1 = pose_keypoints[t-1]
+      pose_changes.append(l2_norm(v_t, v_tm1))
+    pose_changes = np.array(pose_changes, dtype=np.float32)
+    pose_stab = float(np.average(pose_changes, weights=w[1:])) if pose_changes.size else 0.0
+    pose_score = to_score(pose_stab, *P['pose_l2_norm'], small_is_good=True)
+
+    # --- 5.4 최종(간단 가중 평균). 필요시 더 많은 룰 항목 추가 가능
+    final_score = 0.5*gaze_score + 0.5*pose_score
+
+    results.append({
+      'segment_idx': seg_idx,
+      'scores': {
+        'gaze_paper': gaze_paper_score,
+        'gaze_stability': gaze_stability_score,
+        'gaze_combined': gaze_score,
+        'pose_stability': pose_score,
+        'final': final_score
+      },
+      'raw': {
+        'gaze_change': gaze_change,
+        'pose_l2_mean': pose_stab
       }
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "from google.colab import drive\n",
-        "drive.mount('/content/drive')"
-      ],
-      "metadata": {
-        "colab": {
-          "base_uri": "https://localhost:8080/"
-        },
-        "id": "4NEFZYqnEC4w",
-        "outputId": "c6a43c7b-5db9-4da2-cfb6-678348c242ba"
-      },
-      "execution_count": null,
-      "outputs": [
-        {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "Drive already mounted at /content/drive; to attempt to forcibly remount, call drive.mount(\"/content/drive\", force_remount=True).\n"
-          ]
-        }
-      ]
-    },
-    {
-      "cell_type": "code",
-      "execution_count": null,
-      "metadata": {
-        "colab": {
-          "base_uri": "https://localhost:8080/"
-        },
-        "id": "lESuQuhR5aKc",
-        "outputId": "d0f395c1-4633-4381-df2c-d024ef1186dc",
-        "collapsed": true
-      },
-      "outputs": [
-        {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "Requirement already satisfied: mediapipe in /usr/local/lib/python3.12/dist-packages (0.10.21)\n",
-            "Requirement already satisfied: absl-py in /usr/local/lib/python3.12/dist-packages (from mediapipe) (1.4.0)\n",
-            "Requirement already satisfied: attrs>=19.1.0 in /usr/local/lib/python3.12/dist-packages (from mediapipe) (25.4.0)\n",
-            "Requirement already satisfied: flatbuffers>=2.0 in /usr/local/lib/python3.12/dist-packages (from mediapipe) (25.9.23)\n",
-            "Requirement already satisfied: jax in /usr/local/lib/python3.12/dist-packages (from mediapipe) (0.7.1)\n",
-            "Requirement already satisfied: jaxlib in /usr/local/lib/python3.12/dist-packages (from mediapipe) (0.7.1)\n",
-            "Requirement already satisfied: matplotlib in /usr/local/lib/python3.12/dist-packages (from mediapipe) (3.10.0)\n",
-            "Requirement already satisfied: numpy<2 in /usr/local/lib/python3.12/dist-packages (from mediapipe) (1.26.4)\n",
-            "Requirement already satisfied: opencv-contrib-python in /usr/local/lib/python3.12/dist-packages (from mediapipe) (4.11.0.86)\n",
-            "Requirement already satisfied: protobuf<5,>=4.25.3 in /usr/local/lib/python3.12/dist-packages (from mediapipe) (4.25.8)\n",
-            "Requirement already satisfied: sounddevice>=0.4.4 in /usr/local/lib/python3.12/dist-packages (from mediapipe) (0.5.3)\n",
-            "Requirement already satisfied: sentencepiece in /usr/local/lib/python3.12/dist-packages (from mediapipe) (0.2.1)\n",
-            "Requirement already satisfied: CFFI>=1.0 in /usr/local/lib/python3.12/dist-packages (from sounddevice>=0.4.4->mediapipe) (2.0.0)\n",
-            "Requirement already satisfied: ml_dtypes>=0.5.0 in /usr/local/lib/python3.12/dist-packages (from jax->mediapipe) (0.5.4)\n",
-            "Requirement already satisfied: opt_einsum in /usr/local/lib/python3.12/dist-packages (from jax->mediapipe) (3.4.0)\n",
-            "Requirement already satisfied: scipy>=1.12 in /usr/local/lib/python3.12/dist-packages (from jax->mediapipe) (1.16.3)\n",
-            "Requirement already satisfied: contourpy>=1.0.1 in /usr/local/lib/python3.12/dist-packages (from matplotlib->mediapipe) (1.3.3)\n",
-            "Requirement already satisfied: cycler>=0.10 in /usr/local/lib/python3.12/dist-packages (from matplotlib->mediapipe) (0.12.1)\n",
-            "Requirement already satisfied: fonttools>=4.22.0 in /usr/local/lib/python3.12/dist-packages (from matplotlib->mediapipe) (4.60.1)\n",
-            "Requirement already satisfied: kiwisolver>=1.3.1 in /usr/local/lib/python3.12/dist-packages (from matplotlib->mediapipe) (1.4.9)\n",
-            "Requirement already satisfied: packaging>=20.0 in /usr/local/lib/python3.12/dist-packages (from matplotlib->mediapipe) (25.0)\n",
-            "Requirement already satisfied: pillow>=8 in /usr/local/lib/python3.12/dist-packages (from matplotlib->mediapipe) (11.3.0)\n",
-            "Requirement already satisfied: pyparsing>=2.3.1 in /usr/local/lib/python3.12/dist-packages (from matplotlib->mediapipe) (3.2.5)\n",
-            "Requirement already satisfied: python-dateutil>=2.7 in /usr/local/lib/python3.12/dist-packages (from matplotlib->mediapipe) (2.9.0.post0)\n",
-            "Requirement already satisfied: pycparser in /usr/local/lib/python3.12/dist-packages (from CFFI>=1.0->sounddevice>=0.4.4->mediapipe) (2.23)\n",
-            "Requirement already satisfied: six>=1.5 in /usr/local/lib/python3.12/dist-packages (from python-dateutil>=2.7->matplotlib->mediapipe) (1.17.0)\n"
-          ]
-        },
-        {
-          "output_type": "stream",
-          "name": "stderr",
-          "text": [
-            "WARNING:py.warnings:/usr/local/lib/python3.12/dist-packages/jaxlib/plugin_support.py:71: RuntimeWarning: JAX plugin jax_cuda12_plugin version 0.7.2 is installed, but it is not compatible with the installed jaxlib version 0.7.1, so it will not be used.\n",
-            "  warnings.warn(\n",
-            "\n"
-          ]
-        }
-      ],
-      "source": [
-        "!pip install mediapipe\n",
-        "\n",
-        "# =========================\n",
-        "# 1) 라이브러리 임포트\n",
-        "# =========================\n",
-        "import os\n",
-        "import cv2\n",
-        "import numpy as np #파일 경로, 영상처리, 수치연산 사용 import\n",
-        "from moviepy.editor import VideoFileClip #동영상에서 특정 시각 프레임을 뽑아오기 위해 moviePy 사용\n",
-        "import mediapipe as mp # 얼굴 눈 몸 랜드마크 검출\n",
-        "import pandas as pd"
-      ]
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "# --- EAR에 쓸 MediaPipe FaceMesh 눈 랜드마크 인덱스(6 points) ---\n",
-        "# (자주 쓰이는 조합. 왼/오른쪽 각각 p1..p6 순서)\n",
-        "LEFT_EYE_IDXS  = [33, 160, 158, 133, 153, 144]   # p1,p2,p3,p4,p5,p6\n",
-        "RIGHT_EYE_IDXS = [362, 385, 387, 263, 373, 380]  # p1,p2,p3,p4,p5,p6\n",
-        "\n",
-        "def eye_aspect_ratio_6pts(eye6): #입력된 6점으로 ear 계산\n",
-        "    # eye6: np.array shape (6,2) in pixel coords\n",
-        "    p1,p2,p3,p4,p5,p6 = eye6\n",
-        "    vert = np.linalg.norm(p2-p6) + np.linalg.norm(p3-p5)\n",
-        "    horiz = 2.0*np.linalg.norm(p1-p4) + 1e-8\n",
-        "    return float(vert / horiz)\n",
-        "\n",
-        "def time_decay_weights(T, lam=0.08):\n",
-        "    # 세그먼트 내부 최근 프레임에 더 큰 가중치를 주는 지수 감쇠 가중치 w 생성, 인덱스가 뒤로 갈수록 (최근으로 갈 수록 값이 큼)\n",
-        "    idx = np.arange(T)\n",
-        "    w = np.exp(-lam * (T - 1 - idx))\n",
-        "    return w / w.sum()\n",
-        "\n",
-        "def to_score(x, lo, hi, small_is_good=True): #어떤 원시값 x를 [low, high]으로 클리핑 후 0~1 점수화\n",
-        "    x = np.clip(x, lo, hi)\n",
-        "    if small_is_good:\n",
-        "        return 1.0 - (x - lo) / (hi - lo + 1e-8)\n",
-        "    else:\n",
-        "        return (x - lo) / (hi - lo + 1e-8)\n",
-        "\n",
-        "def l2_norm(a, b): #두 벡터 간 L2 (유클리드) 거리\n",
-        "    return np.linalg.norm(a - b, ord=2)\n",
-        "\n",
-        "# 논문식 통합 눈감음값→집중도 (세그먼트 단위)\n",
-        "def paper_gaze_score_from_ears(ear_L_series, ear_R_series, ear_thresh=0.21,\n",
-        "                               ec_clip=(1e-3, 0.9), conc_minmax=(1.0, 10.0)):\n",
-        "    # 유효 프레임(눈 랜드마크 성공)만 집계\n",
-        "    L_valid = np.isfinite(ear_L_series)\n",
-        "    R_valid = np.isfinite(ear_R_series)\n",
-        "    c_l = L_valid.mean() if L_valid.size else 0.0 #유효 프레임 (신뢰도)\n",
-        "    c_r = R_valid.mean() if R_valid.size else 0.0 #유효 프레임 (신뢰도)\n",
-        "\n",
-        "    if c_l + c_r <= 0:\n",
-        "        return 0.5  # 정보 부족시 중립\n",
-        "\n",
-        "    # 닫힘 비율 e_l, e_r\n",
-        "    e_l = (ear_L_series[L_valid] < ear_thresh).mean() if c_l > 0 else np.nan\n",
-        "    e_r = (ear_R_series[R_valid] < ear_thresh).mean() if c_r > 0 else np.nan\n",
-        "    e_l = 0.0 if np.isnan(e_l) else float(e_l)\n",
-        "    e_r = 0.0 if np.isnan(e_r) else float(e_r)\n",
-        "\n",
-        "    e_c = (c_l*e_l + c_r*e_r) / (c_l + c_r) #통합 눈 감음 값\n",
-        "    e_c = float(np.clip(e_c, ec_clip[0], ec_clip[1]))  # 폭주 방지\n",
-        "    conc_raw = 1.0 / e_c #집중도 원시값 (닫힘 적을수록 큼)\n",
-        "\n",
-        "    mn, mx = conc_minmax #min-max 정규화 후 0~1로 반환\n",
-        "    conc_norm = (conc_raw - mn) / (mx - mn + 1e-8)\n",
-        "    return float(np.clip(conc_norm, 0.0, 1.0))\n",
-        "\n",
-        "# =========================\n",
-        "# 2) 영상 경로 & 파라미터\n",
-        "# =========================\n",
-        "from google.colab import drive\n",
-        "drive.mount('/content/drive')\n",
-        "\n",
-        "video_path = \"/content/drive/MyDrive/videos/video_data1_kimnamwoo.mp4\"\n",
-        "target_fps   = 10            # 샘플링 fps (초당 10 프레임으로 균일 샘플링)\n",
-        "segment_sec  = 5             # 세그먼트 길이(초), 세그먼트 길이를 5초 = 50프레임으로 설정\n",
-        "segment_size = target_fps * segment_sec\n",
-        "model_input_size = (224, 224)  # ViT 입력 크기, 얼굴 crop을 모델 입력 크기로 리사이즈\n",
-        "\n",
-        "if not os.path.exists(video_path):\n",
-        "    raise FileNotFoundError(f\"{video_path} 존재하지 않음\")\n",
-        "\n",
-        "# =========================\n",
-        "# 3) MediaPipe 초기화 (video용)\n",
-        "# =========================\n",
-        "mp_face = mp.solutions.face_mesh.FaceMesh(\n",
-        "    static_image_mode=False,          # 영상 처리 → False 권장, 비디오 모드로 FaceMesh 초기화(연속 프레임 추적 안정, 홍채/정교화 사용).\n",
-        "    max_num_faces=1,\n",
-        "    refine_landmarks=True             # iris/정교화\n",
-        ")\n",
-        "mp_pose = mp.solutions.pose.Pose(     #pose도 비디오 모드로 초기화\n",
-        "    static_image_mode=False\n",
-        ")\n",
-        "\n",
-        "# =========================\n",
-        "# 4) 영상 읽고 프레임 샘플링 + 얼굴 crop + 정규화 + 눈/EAR + Pose\n",
-        "# =========================\n",
-        "clip = VideoFileClip(video_path)\n",
-        "duration = clip.duration\n",
-        "num_frames = int(duration * target_fps)\n",
-        "\n",
-        "processed_frames = []     # 모델 입력용 face crop (정규화)\n",
-        "face_bboxes = []          # (x1,y1,x2,y2) or None, 얼굴 바운딩 박스\n",
-        "eyes_landmarks = []       # (eyeL(6,2), eyeR(6,2)) or None\n",
-        "pose_keypoints = []       # (33*3,) float list\n",
-        "\n",
-        "for t_idx in range(num_frames):\n",
-        "    t_sec = t_idx / target_fps\n",
-        "    frame_rgb = clip.get_frame(t_sec)                 # RGB\n",
-        "    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)\n",
-        "    h, w, _ = frame_bgr.shape\n",
-        "\n",
-        "    # --- FaceMesh\n",
-        "    res_face = mp_face.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))\n",
-        "\n",
-        "    bbox = None\n",
-        "    eye_pair = None\n",
-        "    if res_face.multi_face_landmarks:\n",
-        "        lm = res_face.multi_face_landmarks[0].landmark\n",
-        "        x_coords = np.array([p.x for p in lm]); y_coords = np.array([p.y for p in lm])\n",
-        "        xmin, xmax = int(x_coords.min()*w), int(x_coords.max()*w)\n",
-        "        ymin, ymax = int(y_coords.min()*h), int(y_coords.max()*h)\n",
-        "        # bbox clip\n",
-        "        xmin, ymin = max(0, xmin), max(0, ymin)\n",
-        "        xmax, ymax = min(w-1, xmax), min(h-1, ymax)\n",
-        "        if xmax > xmin and ymax > ymin:\n",
-        "            bbox = (xmin, ymin, xmax, ymax)\n",
-        "            face_crop = frame_bgr[ymin:ymax, xmin:xmax]\n",
-        "            if face_crop.size > 0:\n",
-        "                face_crop_resized = cv2.resize(face_crop, model_input_size)\n",
-        "                face_crop_norm = (face_crop_resized.astype(np.float32)/127.5) - 1.0\n",
-        "                processed_frames.append(face_crop_norm)\n",
-        "            else:\n",
-        "                # 얼굴 실패 시 프레임 스킵\n",
-        "                continue\n",
-        "        else:\n",
-        "            continue\n",
-        "\n",
-        "        # EAR용 눈 6점씩 픽셀좌표 뽑기\n",
-        "        lm_np = np.array([[p.x*w, p.y*h] for p in lm], dtype=np.float32)\n",
-        "        try:\n",
-        "            eyeL = lm_np[LEFT_EYE_IDXS, :]\n",
-        "            eyeR = lm_np[RIGHT_EYE_IDXS, :]\n",
-        "            eye_pair = (eyeL, eyeR)\n",
-        "        except Exception:\n",
-        "            eye_pair = None\n",
-        "    else:\n",
-        "        # 얼굴 없으면 이 프레임 전체를 건너뜀(세그먼트 정합을 위해 skip)\n",
-        "        continue\n",
-        "\n",
-        "    # --- Pose\n",
-        "    res_pose = mp_pose.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))\n",
-        "    if res_pose.pose_landmarks:\n",
-        "        vec = []\n",
-        "        for lm_p in res_pose.pose_landmarks.landmark:\n",
-        "            vec.extend([lm_p.x, lm_p.y, lm_p.z])\n",
-        "        pose_keypoints.append(vec)\n",
-        "    else:\n",
-        "        pose_keypoints.append([0.0]*(33*3))\n",
-        "\n",
-        "    # 저장(얼굴이 있었던 프레임만 append했으므로 길이 정합 ok)\n",
-        "    face_bboxes.append(bbox)\n",
-        "    eyes_landmarks.append(eye_pair)\n",
-        "\n",
-        "processed_frames = np.array(processed_frames)\n",
-        "pose_keypoints = np.array(pose_keypoints, dtype=np.float32)\n",
-        "\n",
-        "print(\"샘플링 + 전처리 완료:\", processed_frames.shape)\n",
-        "print(\"Pose keypoints shape:\", pose_keypoints.shape)\n",
-        "\n",
-        "# =========================\n",
-        "# 5) 세그먼트 점수 계산 (논문식 시선 + 기존 안정성 + 자세)\n",
-        "# =========================\n",
-        "def compute_segment_scores(processed_frames, pose_keypoints, eyes_landmarks,\n",
-        "                           segment_size,\n",
-        "                           params=None):\n",
-        "    T = len(processed_frames)\n",
-        "    num_segments = T // segment_size\n",
-        "    results = []\n",
-        "\n",
-        "    P = {\n",
-        "        'ear_thresh': 0.21,\n",
-        "        'gaze_change_norm': (0.0, 0.50),   # 작을수록 좋음\n",
-        "        'pose_l2_norm':     (0.0, 0.30),   # 작을수록 좋음\n",
-        "        'time_decay_lambda': 0.08,         # 세그먼트 내부 프레임 가중\n",
-        "        'gaze_mix': {'paper': 0.7, 'stability': 0.3},  # 논문식 vs 기존 프록시 가중\n",
-        "        'ec_clip': (1e-3, 0.9),\n",
-        "        'conc_minmax': (1.0, 10.0)\n",
-        "    }\n",
-        "    if params: P.update(params)\n",
-        "\n",
-        "    for seg_idx in range(num_segments):\n",
-        "        s = seg_idx * segment_size\n",
-        "        e = s + segment_size\n",
-        "        w = time_decay_weights(segment_size, lam=P['time_decay_lambda'])\n",
-        "\n",
-        "        # --- 5.1 기존 gaze stability (RGB mean 프록시)\n",
-        "        gx = processed_frames[s:e].reshape(segment_size, -1).mean(axis=1)\n",
-        "        gdiff = np.abs(np.diff(gx))\n",
-        "        gaze_change = float(np.average(gdiff, weights=w[1:]))\n",
-        "        gaze_stability_score = to_score(gaze_change, *P['gaze_change_norm'], small_is_good=True)\n",
-        "\n",
-        "        # --- 5.2 논문식 gaze (EAR → e_l, e_r → e_c → 1/e_c)\n",
-        "        ear_L = []\n",
-        "        ear_R = []\n",
-        "        for t in range(s, e):\n",
-        "            eyes = eyes_landmarks[t]\n",
-        "            if eyes is None:\n",
-        "                ear_L.append(np.nan); ear_R.append(np.nan)\n",
-        "                continue\n",
-        "            eyeL, eyeR = eyes\n",
-        "            try:\n",
-        "                ear_L.append(eye_aspect_ratio_6pts(eyeL))\n",
-        "                ear_R.append(eye_aspect_ratio_6pts(eyeR))\n",
-        "            except Exception:\n",
-        "                ear_L.append(np.nan); ear_R.append(np.nan)\n",
-        "        ear_L = np.array(ear_L, dtype=np.float32)\n",
-        "        ear_R = np.array(ear_R, dtype=np.float32)\n",
-        "        gaze_paper_score = paper_gaze_score_from_ears(\n",
-        "            ear_L, ear_R,\n",
-        "            ear_thresh=P['ear_thresh'],\n",
-        "            ec_clip=P['ec_clip'],\n",
-        "            conc_minmax=P['conc_minmax']\n",
-        "        )\n",
-        "        gaze_score = P['gaze_mix']['paper']*gaze_paper_score + P['gaze_mix']['stability']*gaze_stability_score\n",
-        "\n",
-        "        # --- 5.3 Pose stability (프레임간 키포인트 L2, 작을수록 좋음)\n",
-        "        pose_changes = []\n",
-        "        for t in range(s+1, e):\n",
-        "            v_t   = pose_keypoints[t]\n",
-        "            v_tm1 = pose_keypoints[t-1]\n",
-        "            pose_changes.append(l2_norm(v_t, v_tm1))\n",
-        "        pose_changes = np.array(pose_changes, dtype=np.float32)\n",
-        "        pose_stab = float(np.average(pose_changes, weights=w[1:])) if pose_changes.size else 0.0\n",
-        "        pose_score = to_score(pose_stab, *P['pose_l2_norm'], small_is_good=True)\n",
-        "\n",
-        "        # --- 5.4 최종(간단 가중 평균). 필요시 더 많은 룰 항목 추가 가능\n",
-        "        final_score = 0.5*gaze_score + 0.5*pose_score\n",
-        "\n",
-        "        results.append({\n",
-        "            'segment_idx': seg_idx,\n",
-        "            'scores': {\n",
-        "                'gaze_paper': gaze_paper_score,\n",
-        "                'gaze_stability': gaze_stability_score,\n",
-        "                'gaze_combined': gaze_score,\n",
-        "                'pose_stability': pose_score,\n",
-        "                'final': final_score\n",
-        "            },\n",
-        "            'raw': {\n",
-        "                'gaze_change': gaze_change,\n",
-        "                'pose_l2_mean': pose_stab\n",
-        "            }\n",
-        "        })\n",
-        "\n",
-        "    return results\n",
-        "\n",
-        "seg_results = compute_segment_scores(\n",
-        "    processed_frames=processed_frames,\n",
-        "    pose_keypoints=pose_keypoints,\n",
-        "    eyes_landmarks=eyes_landmarks,\n",
-        "    segment_size=segment_size,\n",
-        "    params={\n",
-        "        'time_decay_lambda': 0.08,\n",
-        "        'gaze_mix': {'paper': 0.7, 'stability': 0.3},\n",
-        "        'conc_minmax': (1.0, 10.0),  # 데이터 보고 튜닝 권장\n",
-        "    }\n",
-        ")\n",
-        "\n",
-        "print(\"5초 단위 final scores 예시:\",\n",
-        "      [round(r['scores']['final'], 3) for r in seg_results[:10]])\n"
-      ],
-      "metadata": {
-        "colab": {
-          "base_uri": "https://localhost:8080/"
-        },
-        "id": "05QLXb6xcSzg",
-        "outputId": "61ede3e6-03db-4df7-9037-de63771e4380"
-      },
-      "execution_count": null,
-      "outputs": [
-        {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "Drive already mounted at /content/drive; to attempt to forcibly remount, call drive.mount(\"/content/drive\", force_remount=True).\n",
-            "샘플링 + 전처리 완료: (1817, 224, 224, 3)\n",
-            "Pose keypoints shape: (1817, 99)\n",
-            "5초 단위 final scores 예시: [0.353, 0.173, 0.204, 0.223, 0.374, 0.875, 0.808, 0.805, 0.357, 0.288]\n"
-          ]
-        }
-      ]
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "# ... (위 초기화 동일)\n",
-        "\n",
-        "processed_frames = []\n",
-        "face_bboxes = []\n",
-        "eyes_landmarks = []\n",
-        "pose_keypoints = []\n",
-        "frame_sizes = []   # ← 추가: (w,h) 저장\n",
-        "\n",
-        "for t_idx in range(num_frames):\n",
-        "    t_sec = t_idx / target_fps\n",
-        "    frame_rgb = clip.get_frame(t_sec)\n",
-        "    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)\n",
-        "    h, w, _ = frame_bgr.shape\n",
-        "\n",
-        "    res_face = mp_face.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))\n",
-        "    if not res_face.multi_face_landmarks:\n",
-        "        continue\n",
-        "\n",
-        "    lm = res_face.multi_face_landmarks[0].landmark\n",
-        "    x_coords = np.array([p.x for p in lm]); y_coords = np.array([p.y for p in lm])\n",
-        "    xmin, xmax = int(x_coords.min()*w), int(x_coords.max()*w)\n",
-        "    ymin, ymax = int(y_coords.min()*h), int(y_coords.max()*h)\n",
-        "    xmin, ymin = max(0, xmin), max(0, ymin)\n",
-        "    xmax, ymax = min(w-1, xmax), min(h-1, ymax)\n",
-        "    if xmax <= xmin or ymax <= ymin:\n",
-        "        continue\n",
-        "\n",
-        "    bbox = (xmin, ymin, xmax, ymax)\n",
-        "    face_bboxes.append(bbox)\n",
-        "    frame_sizes.append((w, h))   # ← 추가: 이 프레임의 원본 크기 기록\n",
-        "\n",
-        "    face_crop = frame_bgr[ymin:ymax, xmin:xmax]\n",
-        "    if face_crop.size == 0:\n",
-        "        continue\n",
-        "    face_crop_resized = cv2.resize(face_crop, model_input_size)\n",
-        "    face_crop_norm = (face_crop_resized.astype(np.float32)/127.5) - 1.0\n",
-        "    processed_frames.append(face_crop_norm)\n",
-        "\n",
-        "    lm_np = np.array([[p.x*w, p.y*h] for p in lm], dtype=np.float32)\n",
-        "    try:\n",
-        "        eyeL = lm_np[LEFT_EYE_IDXS, :]\n",
-        "        eyeR = lm_np[RIGHT_EYE_IDXS, :]\n",
-        "        eyes_landmarks.append((eyeL, eyeR))\n",
-        "    except Exception:\n",
-        "        eyes_landmarks.append(None)\n",
-        "\n",
-        "    res_pose = mp_pose.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))\n",
-        "    if res_pose.pose_landmarks:\n",
-        "        vec = []\n",
-        "        for lm_p in res_pose.pose_landmarks.landmark:\n",
-        "            vec.extend([lm_p.x, lm_p.y, lm_p.z])  # MediaPipe Pose는 정규화 좌표\n",
-        "        pose_keypoints.append(vec)\n",
-        "    else:\n",
-        "        pose_keypoints.append([0.0]*(33*3))\n",
-        "\n",
-        "processed_frames = np.array(processed_frames)\n",
-        "pose_keypoints = np.array(pose_keypoints, dtype=np.float32)\n"
-      ],
-      "metadata": {
-        "id": "DFJ-fn0uhqpP"
-      },
-      "execution_count": null,
-      "outputs": []
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "# ----------------------------------------\n",
-        "# BlazePose index mapping\n",
-        "# ----------------------------------------\n",
-        "POSE_IDX = {\n",
-        "    'nose': 0,\n",
-        "    'eye_l': 2, 'eye_r': 5,\n",
-        "    'shoulder_l': 11, 'shoulder_r': 12,\n",
-        "    'wrist_l': 15, 'wrist_r': 16,\n",
-        "    'hip_l': 23, 'hip_r': 24\n",
-        "}\n",
-        "\n",
-        "def get_pose_xy(pose_vec, idx, w, h):\n",
-        "    base = idx * 3\n",
-        "    if base+1 >= len(pose_vec):\n",
-        "        return None\n",
-        "    x_n, y_n = pose_vec[base], pose_vec[base+1]\n",
-        "    if not (0 <= x_n <= 1 and 0 <= y_n <= 1):\n",
-        "        return None\n",
-        "    return (x_n * w, y_n * h)\n",
-        "\n",
-        "def center_of_bbox(b):\n",
-        "    x1,y1,x2,y2 = b\n",
-        "    return np.array([(x1+x2)/2, (y1+y2)/2], dtype=np.float32)\n",
-        "\n",
-        "def angle_from_horizontal(p_left, p_right):\n",
-        "    v = np.array(p_right) - np.array(p_left)\n",
-        "    return abs(np.arctan2(v[1], v[0]))\n",
-        "\n",
-        "def perclos(ear_series, ear_thresh=0.21):\n",
-        "    ear_series = np.array(ear_series, dtype=np.float32)\n",
-        "    valid = np.isfinite(ear_series)\n",
-        "    if valid.sum()==0: return np.nan\n",
-        "    return float((ear_series[valid] < ear_thresh).mean())\n",
-        "\n",
-        "\n",
-        "# ----------------------------------------\n",
-        "# 업그레이드 졸음 기능 (Baseline EAR + 70% closure + 5초 지속 + head nod)\n",
-        "# ----------------------------------------\n",
-        "def compute_EAR_baseline(ear_series, min_samples=30):\n",
-        "    ear_series = np.array(ear_series)\n",
-        "    ear_series = ear_series[np.isfinite(ear_series)]\n",
-        "    if len(ear_series) < min_samples:\n",
-        "        return np.median(ear_series) if len(ear_series)>0 else 0.25\n",
-        "    return np.median(ear_series[:min_samples])\n",
-        "\n",
-        "def is_eye_closure(ear, ear_baseline, ratio=0.30):\n",
-        "    return ear < (ear_baseline * ratio)\n",
-        "\n",
-        "\n",
-        "# ----------------------------------------\n",
-        "# segment scoring\n",
-        "# ----------------------------------------\n",
-        "def compute_segment_scores_7features(\n",
-        "    processed_frames,\n",
-        "    pose_keypoints,\n",
-        "    eyes_landmarks,\n",
-        "    face_bboxes,\n",
-        "    frame_sizes,\n",
-        "    segment_size,\n",
-        "    phone_bboxes=None,\n",
-        "    ref_center=None,\n",
-        "    ref_radius=None,\n",
-        "    params=None\n",
-        "):\n",
-        "\n",
-        "    PHONE_USE_THRESH = 25.0\n",
-        "    T = len(processed_frames)\n",
-        "    num_segments = T // segment_size\n",
-        "    results = []\n",
-        "\n",
-        "    # 기본 파라미터\n",
-        "    P = {\n",
-        "        'ear_thresh': 0.21,\n",
-        "        'time_decay_lambda': 0.08,\n",
-        "        'norm': {\n",
-        "            'head_angle_rad':  (0.0, 0.35),\n",
-        "            'shoulder_tilt':   (0.0, 0.25),\n",
-        "            'hand_face_dist':  (30.0, 200.0),\n",
-        "            'blink_rate_proxy':(0.02, 0.30),\n",
-        "            'perclos':         (0.00, 0.35)\n",
-        "        },\n",
-        "        'w': {\n",
-        "            'phone_use':    0.16,\n",
-        "            'seat_depart':  0.12,\n",
-        "            'head_angle':   0.12,\n",
-        "            'shoulder_tilt':0.12,\n",
-        "            'hand_face':    0.16,\n",
-        "            'blink':        0.16,\n",
-        "            'perclos':      0.16\n",
-        "        },\n",
-        "        'seat_departure_penalty': 0.0\n",
-        "    }\n",
-        "    if params:\n",
-        "        for k,v in params.items():\n",
-        "            if k in P and isinstance(v,dict): P[k].update(v)\n",
-        "            else: P[k]=v\n",
-        "\n",
-        "    # 기준점 자동 설정\n",
-        "    if ref_center is None or ref_radius is None:\n",
-        "        fcs = [center_of_bbox(b) for b in face_bboxes[:min(len(face_bboxes), max(segment_size, 30))] if b is not None]\n",
-        "        if len(fcs)>=3:\n",
-        "            ref_center = tuple(np.median(np.stack(fcs, axis=0),axis=0))\n",
-        "            hs=[(b[3]-b[1]) for b in face_bboxes[:min(len(face_bboxes),max(segment_size,30))] if b is not None]\n",
-        "            ref_radius = float(max(60.0, 2*np.median(hs))) if hs else 120.0\n",
-        "        else:\n",
-        "            ref_center=(0,0); ref_radius=120\n",
-        "\n",
-        "    W = P['w']\n",
-        "\n",
-        "    # EAR baseline 저장용\n",
-        "    global EAR_baseline_global\n",
-        "    baseline_buffer = []\n",
-        "    EAR_baseline_global = 0.25\n",
-        "\n",
-        "    fps = 30  # 영상 FPS (필요시 수정)\n",
-        "\n",
-        "    for seg_idx in range(num_segments):\n",
-        "        s = seg_idx * segment_size\n",
-        "        e = s + segment_size\n",
-        "        wdec = time_decay_weights(segment_size, lam=P['time_decay_lambda'])\n",
-        "\n",
-        "        # 누적\n",
-        "        phone_use_flags=[]\n",
-        "        head_angles=[]\n",
-        "        shoulder_tilts=[]\n",
-        "        hand_face_scores=[]\n",
-        "        seat_flags=[]\n",
-        "        ear_series=[]\n",
-        "        blink_transitions=0\n",
-        "        prev_closed=None\n",
-        "\n",
-        "        closure_frames=0\n",
-        "        sleepy_flags=[]\n",
-        "\n",
-        "        for t in range(s, e):\n",
-        "            w,h = frame_sizes[t]\n",
-        "            fb = face_bboxes[t]\n",
-        "            fc = center_of_bbox(fb) if fb is not None else None\n",
-        "\n",
-        "            # ---------------------\n",
-        "            # 1) 폰 사용 (손-폰 거리)\n",
-        "            # ---------------------\n",
-        "            if phone_bboxes is not None and phone_bboxes[t] is not None:\n",
-        "                p = pose_keypoints[t]\n",
-        "                hand_center=None\n",
-        "                if p is not None:\n",
-        "                    wL=get_pose_xy(p,POSE_IDX['wrist_l'],w,h)\n",
-        "                    wR=get_pose_xy(p,POSE_IDX['wrist_r'],w,h)\n",
-        "                    ws=[x for x in (wL,wR) if x is not None]\n",
-        "                    if ws:\n",
-        "                        hand_center=np.mean(np.array(ws),axis=0)\n",
-        "\n",
-        "                if hand_center is not None:\n",
-        "                    d_hp = np.linalg.norm(center_of_bbox(phone_bboxes[t]) - hand_center)\n",
-        "                    phone_use_flags.append(d_hp < PHONE_USE_THRESH)\n",
-        "                else:\n",
-        "                    phone_use_flags.append(False)\n",
-        "            else:\n",
-        "                phone_use_flags.append(False)\n",
-        "\n",
-        "            # ---------------------\n",
-        "            # 2) 고개 각도\n",
-        "            # ---------------------\n",
-        "            if eyes_landmarks[t] is not None:\n",
-        "                eyeL,eyeR = eyes_landmarks[t]\n",
-        "                cenL=eyeL.mean(axis=0); cenR=eyeR.mean(axis=0)\n",
-        "                head_angles.append(angle_from_horizontal(cenL,cenR))\n",
-        "\n",
-        "            # ---------------------\n",
-        "            # 3) 어깨 기울기 + 손 얼굴 거리 + 자리 이탈\n",
-        "            # ---------------------\n",
-        "            p = pose_keypoints[t]\n",
-        "            if p is not None:\n",
-        "                sL=get_pose_xy(p,POSE_IDX['shoulder_l'],w,h)\n",
-        "                sR=get_pose_xy(p,POSE_IDX['shoulder_r'],w,h)\n",
-        "                if sL and sR:\n",
-        "                    shoulder_tilts.append(angle_from_horizontal(sL,sR))\n",
-        "\n",
-        "                if fc is not None:\n",
-        "                    wL=get_pose_xy(p,POSE_IDX['wrist_l'],w,h)\n",
-        "                    wR=get_pose_xy(p,POSE_IDX['wrist_r'],w,h)\n",
-        "                    ws=[x for x in (wL,wR) if x is not None]\n",
-        "                    if ws:\n",
-        "                        hand_center=np.mean(np.array(ws),axis=0)\n",
-        "                        d_hf=np.linalg.norm(hand_center-fc)\n",
-        "                        hand_face_scores.append(to_score(d_hf,*P['norm']['hand_face_dist'],small_is_good=False))\n",
-        "\n",
-        "                nose=get_pose_xy(p,POSE_IDX['nose'],w,h)\n",
-        "                if nose is None:\n",
-        "                    hl=get_pose_xy(p,POSE_IDX['hip_l'],w,h)\n",
-        "                    hr=get_pose_xy(p,POSE_IDX['hip_r'],w,h)\n",
-        "                    nose = tuple(np.mean([hl,hr],axis=0)) if (hl and hr) else None\n",
-        "\n",
-        "                if nose is not None:\n",
-        "                    dist=np.linalg.norm(np.array(nose)-np.array(ref_center))\n",
-        "                    seat_flags.append(dist>ref_radius)\n",
-        "\n",
-        "            # -----------------------------------------\n",
-        "            # 4) ✨ 업그레이드된 EAR 기반 졸음 탐지\n",
-        "            # -----------------------------------------\n",
-        "            if eyes_landmarks[t] is not None:\n",
-        "                try:\n",
-        "                    eyeL,eyeR = eyes_landmarks[t]\n",
-        "                    earL=eye_aspect_ratio_6pts(eyeL)\n",
-        "                    earR=eye_aspect_ratio_6pts(eyeR)\n",
-        "                    ear=0.5*(earL+earR)\n",
-        "                    ear_series.append(ear)\n",
-        "\n",
-        "                    # baseline 초기 구간 모으기\n",
-        "                    if seg_idx==0 and t<40:\n",
-        "                        baseline_buffer.append(ear)\n",
-        "\n",
-        "                    # baseline 계산(첫 세그먼트 끝에서)\n",
-        "                    if seg_idx==0 and t==e-1:\n",
-        "                        EAR_baseline = compute_EAR_baseline(baseline_buffer)\n",
-        "                        EAR_baseline_global = EAR_baseline\n",
-        "                    else:\n",
-        "                        EAR_baseline = EAR_baseline_global\n",
-        "\n",
-        "                    # 70% closure\n",
-        "                    closed_70 = is_eye_closure(ear, EAR_baseline, ratio=0.30)\n",
-        "\n",
-        "                    # closure duration\n",
-        "                    if closed_70: closure_frames += 1\n",
-        "                    else: closure_frames = 0\n",
-        "\n",
-        "                    closure_long = (closure_frames >= int(5 * fps))\n",
-        "\n",
-        "                    # head nod\n",
-        "                    head_nod=False\n",
-        "                    if len(head_angles)>=3:\n",
-        "                        head_nod = (head_angles[-1]-head_angles[-3] > 0.15)\n",
-        "\n",
-        "                    sleepy_flag = closure_long or head_nod\n",
-        "                    sleepy_flags.append(sleepy_flag)\n",
-        "\n",
-        "                except:\n",
-        "                    ear_series.append(np.nan)\n",
-        "\n",
-        "        # -------------------------------\n",
-        "        # 점수 계산\n",
-        "        # -------------------------------\n",
-        "        usage_ratio = sum(phone_use_flags)/len(phone_use_flags)\n",
-        "        phone_use_score = 1.0 - usage_ratio\n",
-        "\n",
-        "        seat_departed = any(seat_flags)\n",
-        "        seat_depart_score = 0.0 if seat_departed else 1.0\n",
-        "\n",
-        "        if head_angles:\n",
-        "            ha=np.array(head_angles)\n",
-        "            head_angle_score=to_score(ha.mean(),*P['norm']['head_angle_rad'],small_is_good=True)\n",
-        "        else: head_angle_score=0.5\n",
-        "\n",
-        "        if shoulder_tilts:\n",
-        "            st=np.array(shoulder_tilts)\n",
-        "            shoulder_tilt_score=to_score(st.mean(),*P['norm']['shoulder_tilt'],small_is_good=True)\n",
-        "        else: shoulder_tilt_score=0.5\n",
-        "\n",
-        "        hand_face_score = np.mean(hand_face_scores) if hand_face_scores else 0.5\n",
-        "\n",
-        "        blink_rate_proxy = blink_transitions/max(1,(e-s))\n",
-        "        blink_score=to_score(blink_rate_proxy,*P['norm']['blink_rate_proxy'],small_is_good=True)\n",
-        "\n",
-        "        # ✨ 업그레이드된 졸음 score\n",
-        "        segment_sleepy = any(sleepy_flags)\n",
-        "        perclos_score = 1.0 - (1.0 if segment_sleepy else 0.0)\n",
-        "\n",
-        "        final_score = (\n",
-        "            W['phone_use']*phone_use_score +\n",
-        "            W['seat_depart']*seat_depart_score +\n",
-        "            W['head_angle']*head_angle_score +\n",
-        "            W['shoulder_tilt']*shoulder_tilt_score +\n",
-        "            W['hand_face']*hand_face_score +\n",
-        "            W['blink']*blink_score +\n",
-        "            W['perclos']*perclos_score\n",
-        "        )\n",
-        "\n",
-        "        results.append({\n",
-        "            'segment_idx': seg_idx,\n",
-        "            'scores': {\n",
-        "                'phone_use': round(phone_use_score,4),\n",
-        "                'seat_depart': round(seat_depart_score,4),\n",
-        "                'head_angle': round(head_angle_score,4),\n",
-        "                'shoulder_tilt': round(shoulder_tilt_score,4),\n",
-        "                'hand_face': round(hand_face_score,4),\n",
-        "                'blink': round(blink_score,4),\n",
-        "                'perclos': round(perclos_score,4),\n",
-        "                'final': round(final_score,4)\n",
-        "            },\n",
-        "            'raw': {\n",
-        "                'usage_ratio': round(usage_ratio,4),\n",
-        "                'sleepy_flag': int(segment_sleepy),\n",
-        "                'blink_rate_proxy': round(blink_rate_proxy,5),\n",
-        "                'EAR_baseline': round(EAR_baseline,4)\n",
-        "            },\n",
-        "            'flags': {\n",
-        "                'seat_departed': seat_departed\n",
-        "            }\n",
-        "        })\n",
-        "\n",
-        "    return results\n"
-      ],
-      "metadata": {
-        "id": "hlngeo2vEFsL"
-      },
-      "execution_count": null,
-      "outputs": []
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "!pip install ipywidgets\n",
-        "from IPython.display import display, HTML, clear_output\n",
-        "import ipywidgets as widgets\n",
-        "import pandas as pd\n",
-        "import base64\n",
-        "import subprocess\n",
-        "\n",
-        "def display_video_player(video_path, start_sec, end_sec):\n",
-        "    seg_path = f\"seg_{start_sec}_{end_sec}.mp4\"\n",
-        "    duration = end_sec - start_sec\n",
-        "\n",
-        "    cmd = f\"ffmpeg -y -ss {start_sec} -i '{video_path}' -t {duration} -c copy {seg_path}\"\n",
-        "    subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n",
-        "\n",
-        "    video = open(seg_path, \"rb\").read()\n",
-        "    b64 = base64.b64encode(video).decode()\n",
-        "\n",
-        "    html = f\"\"\"\n",
-        "    <video width=\"480\" controls autoplay>\n",
-        "        <source src=\"data:video/mp4;base64,{b64}\" type=\"video/mp4\">\n",
-        "    </video>\n",
-        "    \"\"\"\n",
-        "    return HTML(html)\n",
-        "video_path = \"/content/drive/MyDrive/videos/video_data1_kimnamwoo.mp4\"    # 너의 영상 경로\n",
-        "segment_length = 10\n",
-        "video_duration = 120                 # 너의 영상 길이로 수정\n",
-        "num_segments = video_duration // segment_length\n",
-        "\n",
-        "human_labels = []\n",
-        "current_seg = 0\n",
-        "\n",
-        "phone_label = widgets.ToggleButtons(\n",
-        "    options=[(\"Yes\",1), (\"No\",0)], description=\"📱 핸드폰?\"\n",
-        ")\n",
-        "sleepy_label = widgets.ToggleButtons(\n",
-        "    options=[(\"Yes\",1), (\"No\",0)], description=\"😪 졸음?\"\n",
-        ")\n",
-        "seat_label = widgets.ToggleButtons(\n",
-        "    options=[(\"Yes\",1), (\"No\",0)], description=\"🚶 자리이탈?\"\n",
-        ")\n",
-        "\n",
-        "save_button = widgets.Button(\n",
-        "    description=\"저장하고 다음 ▶\",\n",
-        "    button_style=\"success\"\n",
-        ")\n",
-        "\n",
-        "ui_output = widgets.Output()\n",
-        "def show_segment(seg_idx):\n",
-        "    start = seg_idx * segment_length\n",
-        "    end = (seg_idx + 1) * segment_length\n",
-        "\n",
-        "    clear_output()\n",
-        "\n",
-        "    print(f\"=== Segment {seg_idx} ({start}초 ~ {end}초) ===\\n\")\n",
-        "    display(display_video_player(video_path, start, end))\n",
-        "    display(phone_label, sleepy_label, seat_label, save_button, ui_output)\n",
-        "\n",
-        "\n",
-        "def on_save_clicked(b):\n",
-        "    global current_seg\n",
-        "\n",
-        "    with ui_output:\n",
-        "        clear_output()\n",
-        "        print(f\"Segment {current_seg} 저장됨.\")\n",
-        "\n",
-        "    # 데이터 저장\n",
-        "    human_labels.append({\n",
-        "        \"segment_idx\": current_seg,\n",
-        "        \"phone_gt\": phone_label.value,\n",
-        "        \"sleepy_gt\": sleepy_label.value,\n",
-        "        \"seat_gt\": seat_label.value,\n",
-        "    })\n",
-        "\n",
-        "    current_seg += 1\n",
-        "\n",
-        "    if current_seg >= num_segments:\n",
-        "        df = pd.DataFrame(human_labels)\n",
-        "        df.to_csv(\"human_labels.csv\", index=False)\n",
-        "\n",
-        "        clear_output()\n",
-        "        print(\"🎉 모든 레이블 저장 완료!\")\n",
-        "        display(df)\n",
-        "        return\n",
-        "\n",
-        "    # 다음 세그먼트로 이동\n",
-        "    show_segment(current_seg)\n",
-        "\n",
-        "\n",
-        "save_button.on_click(on_save_clicked)\n",
-        "show_segment(0)\n"
-      ],
-      "metadata": {
-        "colab": {
-          "base_uri": "https://localhost:8080/",
-          "height": 438,
-          "referenced_widgets": [
-            "7c380710cc944475b88924be7cc575da",
-            "3099d4ea80e44630b3c09057481e0043",
-            "5f22a0eaf62d4a72a2a393787df8e69a",
-            "ed46f64574b349708e9f4d4ff81ab950",
-            "28fc0090947b4c44b0b7a5e593735754",
-            "5606303bc0694ebf9ff623cf6ff55606",
-            "8d37336e437c44088440978b795fd16b",
-            "168d2694c37c43efba65feec27c5a79d",
-            "7cfec29012714b8a9fdd65f8aefb273c",
-            "b588fdcb3eeb4457a27ee9c0adef117b",
-            "40282b4dfb384fdc902323d5fb595d00",
-            "dc0eea0dd73043c8a21177b321e1f279",
-            "5e49bef7ced84169850502998b36e20f",
-            "32a408717b914be7a488bdfc278095b2"
-          ]
-        },
-        "id": "AkmInIB94cEf",
-        "outputId": "956ab4ad-d109-4cf5-dc8b-2fbb789ab524",
-        "collapsed": true
-      },
-      "execution_count": null,
-      "outputs": [
-        {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "🎉 모든 레이블 저장 완료!\n"
-          ]
-        },
-        {
-          "output_type": "display_data",
-          "data": {
-            "text/plain": [
-              "    segment_idx  phone_gt  sleepy_gt  seat_gt\n",
-              "0             0         0          0        0\n",
-              "1             1         0          0        0\n",
-              "2             2         0          0        0\n",
-              "3             3         0          0        0\n",
-              "4             4         0          0        0\n",
-              "5             5         0          0        0\n",
-              "6             6         0          0        0\n",
-              "7             7         0          0        0\n",
-              "8             8         0          0        0\n",
-              "9             9         0          0        0\n",
-              "10           10         0          0        0\n",
-              "11           11         0          0        0"
-            ],
-            "text/html": [
-              "\n",
-              "  <div id=\"df-87aefdb1-7d1e-4d3a-b14d-4ede99403789\" class=\"colab-df-container\">\n",
-              "    <div>\n",
-              "<style scoped>\n",
-              "    .dataframe tbody tr th:only-of-type {\n",
-              "        vertical-align: middle;\n",
-              "    }\n",
-              "\n",
-              "    .dataframe tbody tr th {\n",
-              "        vertical-align: top;\n",
-              "    }\n",
-              "\n",
-              "    .dataframe thead th {\n",
-              "        text-align: right;\n",
-              "    }\n",
-              "</style>\n",
-              "<table border=\"1\" class=\"dataframe\">\n",
-              "  <thead>\n",
-              "    <tr style=\"text-align: right;\">\n",
-              "      <th></th>\n",
-              "      <th>segment_idx</th>\n",
-              "      <th>phone_gt</th>\n",
-              "      <th>sleepy_gt</th>\n",
-              "      <th>seat_gt</th>\n",
-              "    </tr>\n",
-              "  </thead>\n",
-              "  <tbody>\n",
-              "    <tr>\n",
-              "      <th>0</th>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "    </tr>\n",
-              "    <tr>\n",
-              "      <th>1</th>\n",
-              "      <td>1</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "    </tr>\n",
-              "    <tr>\n",
-              "      <th>2</th>\n",
-              "      <td>2</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "    </tr>\n",
-              "    <tr>\n",
-              "      <th>3</th>\n",
-              "      <td>3</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "    </tr>\n",
-              "    <tr>\n",
-              "      <th>4</th>\n",
-              "      <td>4</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "    </tr>\n",
-              "    <tr>\n",
-              "      <th>5</th>\n",
-              "      <td>5</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "    </tr>\n",
-              "    <tr>\n",
-              "      <th>6</th>\n",
-              "      <td>6</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "    </tr>\n",
-              "    <tr>\n",
-              "      <th>7</th>\n",
-              "      <td>7</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "    </tr>\n",
-              "    <tr>\n",
-              "      <th>8</th>\n",
-              "      <td>8</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "    </tr>\n",
-              "    <tr>\n",
-              "      <th>9</th>\n",
-              "      <td>9</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "    </tr>\n",
-              "    <tr>\n",
-              "      <th>10</th>\n",
-              "      <td>10</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "    </tr>\n",
-              "    <tr>\n",
-              "      <th>11</th>\n",
-              "      <td>11</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "      <td>0</td>\n",
-              "    </tr>\n",
-              "  </tbody>\n",
-              "</table>\n",
-              "</div>\n",
-              "    <div class=\"colab-df-buttons\">\n",
-              "\n",
-              "  <div class=\"colab-df-container\">\n",
-              "    <button class=\"colab-df-convert\" onclick=\"convertToInteractive('df-87aefdb1-7d1e-4d3a-b14d-4ede99403789')\"\n",
-              "            title=\"Convert this dataframe to an interactive table.\"\n",
-              "            style=\"display:none;\">\n",
-              "\n",
-              "  <svg xmlns=\"http://www.w3.org/2000/svg\" height=\"24px\" viewBox=\"0 -960 960 960\">\n",
-              "    <path d=\"M120-120v-720h720v720H120Zm60-500h600v-160H180v160Zm220 220h160v-160H400v160Zm0 220h160v-160H400v160ZM180-400h160v-160H180v160Zm440 0h160v-160H620v160ZM180-180h160v-160H180v160Zm440 0h160v-160H620v160Z\"/>\n",
-              "  </svg>\n",
-              "    </button>\n",
-              "\n",
-              "  <style>\n",
-              "    .colab-df-container {\n",
-              "      display:flex;\n",
-              "      gap: 12px;\n",
-              "    }\n",
-              "\n",
-              "    .colab-df-convert {\n",
-              "      background-color: #E8F0FE;\n",
-              "      border: none;\n",
-              "      border-radius: 50%;\n",
-              "      cursor: pointer;\n",
-              "      display: none;\n",
-              "      fill: #1967D2;\n",
-              "      height: 32px;\n",
-              "      padding: 0 0 0 0;\n",
-              "      width: 32px;\n",
-              "    }\n",
-              "\n",
-              "    .colab-df-convert:hover {\n",
-              "      background-color: #E2EBFA;\n",
-              "      box-shadow: 0px 1px 2px rgba(60, 64, 67, 0.3), 0px 1px 3px 1px rgba(60, 64, 67, 0.15);\n",
-              "      fill: #174EA6;\n",
-              "    }\n",
-              "\n",
-              "    .colab-df-buttons div {\n",
-              "      margin-bottom: 4px;\n",
-              "    }\n",
-              "\n",
-              "    [theme=dark] .colab-df-convert {\n",
-              "      background-color: #3B4455;\n",
-              "      fill: #D2E3FC;\n",
-              "    }\n",
-              "\n",
-              "    [theme=dark] .colab-df-convert:hover {\n",
-              "      background-color: #434B5C;\n",
-              "      box-shadow: 0px 1px 3px 1px rgba(0, 0, 0, 0.15);\n",
-              "      filter: drop-shadow(0px 1px 2px rgba(0, 0, 0, 0.3));\n",
-              "      fill: #FFFFFF;\n",
-              "    }\n",
-              "  </style>\n",
-              "\n",
-              "    <script>\n",
-              "      const buttonEl =\n",
-              "        document.querySelector('#df-87aefdb1-7d1e-4d3a-b14d-4ede99403789 button.colab-df-convert');\n",
-              "      buttonEl.style.display =\n",
-              "        google.colab.kernel.accessAllowed ? 'block' : 'none';\n",
-              "\n",
-              "      async function convertToInteractive(key) {\n",
-              "        const element = document.querySelector('#df-87aefdb1-7d1e-4d3a-b14d-4ede99403789');\n",
-              "        const dataTable =\n",
-              "          await google.colab.kernel.invokeFunction('convertToInteractive',\n",
-              "                                                    [key], {});\n",
-              "        if (!dataTable) return;\n",
-              "\n",
-              "        const docLinkHtml = 'Like what you see? Visit the ' +\n",
-              "          '<a target=\"_blank\" href=https://colab.research.google.com/notebooks/data_table.ipynb>data table notebook</a>'\n",
-              "          + ' to learn more about interactive tables.';\n",
-              "        element.innerHTML = '';\n",
-              "        dataTable['output_type'] = 'display_data';\n",
-              "        await google.colab.output.renderOutput(dataTable, element);\n",
-              "        const docLink = document.createElement('div');\n",
-              "        docLink.innerHTML = docLinkHtml;\n",
-              "        element.appendChild(docLink);\n",
-              "      }\n",
-              "    </script>\n",
-              "  </div>\n",
-              "\n",
-              "\n",
-              "    <div id=\"df-ab70effb-b843-4690-aba6-16dda81977f5\">\n",
-              "      <button class=\"colab-df-quickchart\" onclick=\"quickchart('df-ab70effb-b843-4690-aba6-16dda81977f5')\"\n",
-              "                title=\"Suggest charts\"\n",
-              "                style=\"display:none;\">\n",
-              "\n",
-              "<svg xmlns=\"http://www.w3.org/2000/svg\" height=\"24px\"viewBox=\"0 0 24 24\"\n",
-              "     width=\"24px\">\n",
-              "    <g>\n",
-              "        <path d=\"M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zM9 17H7v-7h2v7zm4 0h-2V7h2v10zm4 0h-2v-4h2v4z\"/>\n",
-              "    </g>\n",
-              "</svg>\n",
-              "      </button>\n",
-              "\n",
-              "<style>\n",
-              "  .colab-df-quickchart {\n",
-              "      --bg-color: #E8F0FE;\n",
-              "      --fill-color: #1967D2;\n",
-              "      --hover-bg-color: #E2EBFA;\n",
-              "      --hover-fill-color: #174EA6;\n",
-              "      --disabled-fill-color: #AAA;\n",
-              "      --disabled-bg-color: #DDD;\n",
-              "  }\n",
-              "\n",
-              "  [theme=dark] .colab-df-quickchart {\n",
-              "      --bg-color: #3B4455;\n",
-              "      --fill-color: #D2E3FC;\n",
-              "      --hover-bg-color: #434B5C;\n",
-              "      --hover-fill-color: #FFFFFF;\n",
-              "      --disabled-bg-color: #3B4455;\n",
-              "      --disabled-fill-color: #666;\n",
-              "  }\n",
-              "\n",
-              "  .colab-df-quickchart {\n",
-              "    background-color: var(--bg-color);\n",
-              "    border: none;\n",
-              "    border-radius: 50%;\n",
-              "    cursor: pointer;\n",
-              "    display: none;\n",
-              "    fill: var(--fill-color);\n",
-              "    height: 32px;\n",
-              "    padding: 0;\n",
-              "    width: 32px;\n",
-              "  }\n",
-              "\n",
-              "  .colab-df-quickchart:hover {\n",
-              "    background-color: var(--hover-bg-color);\n",
-              "    box-shadow: 0 1px 2px rgba(60, 64, 67, 0.3), 0 1px 3px 1px rgba(60, 64, 67, 0.15);\n",
-              "    fill: var(--button-hover-fill-color);\n",
-              "  }\n",
-              "\n",
-              "  .colab-df-quickchart-complete:disabled,\n",
-              "  .colab-df-quickchart-complete:disabled:hover {\n",
-              "    background-color: var(--disabled-bg-color);\n",
-              "    fill: var(--disabled-fill-color);\n",
-              "    box-shadow: none;\n",
-              "  }\n",
-              "\n",
-              "  .colab-df-spinner {\n",
-              "    border: 2px solid var(--fill-color);\n",
-              "    border-color: transparent;\n",
-              "    border-bottom-color: var(--fill-color);\n",
-              "    animation:\n",
-              "      spin 1s steps(1) infinite;\n",
-              "  }\n",
-              "\n",
-              "  @keyframes spin {\n",
-              "    0% {\n",
-              "      border-color: transparent;\n",
-              "      border-bottom-color: var(--fill-color);\n",
-              "      border-left-color: var(--fill-color);\n",
-              "    }\n",
-              "    20% {\n",
-              "      border-color: transparent;\n",
-              "      border-left-color: var(--fill-color);\n",
-              "      border-top-color: var(--fill-color);\n",
-              "    }\n",
-              "    30% {\n",
-              "      border-color: transparent;\n",
-              "      border-left-color: var(--fill-color);\n",
-              "      border-top-color: var(--fill-color);\n",
-              "      border-right-color: var(--fill-color);\n",
-              "    }\n",
-              "    40% {\n",
-              "      border-color: transparent;\n",
-              "      border-right-color: var(--fill-color);\n",
-              "      border-top-color: var(--fill-color);\n",
-              "    }\n",
-              "    60% {\n",
-              "      border-color: transparent;\n",
-              "      border-right-color: var(--fill-color);\n",
-              "    }\n",
-              "    80% {\n",
-              "      border-color: transparent;\n",
-              "      border-right-color: var(--fill-color);\n",
-              "      border-bottom-color: var(--fill-color);\n",
-              "    }\n",
-              "    90% {\n",
-              "      border-color: transparent;\n",
-              "      border-bottom-color: var(--fill-color);\n",
-              "    }\n",
-              "  }\n",
-              "</style>\n",
-              "\n",
-              "      <script>\n",
-              "        async function quickchart(key) {\n",
-              "          const quickchartButtonEl =\n",
-              "            document.querySelector('#' + key + ' button');\n",
-              "          quickchartButtonEl.disabled = true;  // To prevent multiple clicks.\n",
-              "          quickchartButtonEl.classList.add('colab-df-spinner');\n",
-              "          try {\n",
-              "            const charts = await google.colab.kernel.invokeFunction(\n",
-              "                'suggestCharts', [key], {});\n",
-              "          } catch (error) {\n",
-              "            console.error('Error during call to suggestCharts:', error);\n",
-              "          }\n",
-              "          quickchartButtonEl.classList.remove('colab-df-spinner');\n",
-              "          quickchartButtonEl.classList.add('colab-df-quickchart-complete');\n",
-              "        }\n",
-              "        (() => {\n",
-              "          let quickchartButtonEl =\n",
-              "            document.querySelector('#df-ab70effb-b843-4690-aba6-16dda81977f5 button');\n",
-              "          quickchartButtonEl.style.display =\n",
-              "            google.colab.kernel.accessAllowed ? 'block' : 'none';\n",
-              "        })();\n",
-              "      </script>\n",
-              "    </div>\n",
-              "\n",
-              "    </div>\n",
-              "  </div>\n"
-            ],
-            "application/vnd.google.colaboratory.intrinsic+json": {
-              "type": "dataframe",
-              "summary": "{\n  \"name\": \"print(df_output\",\n  \"rows\": 12,\n  \"fields\": [\n    {\n      \"column\": \"segment_idx\",\n      \"properties\": {\n        \"dtype\": \"number\",\n        \"std\": 3,\n        \"min\": 0,\n        \"max\": 11,\n        \"num_unique_values\": 12,\n        \"samples\": [\n          10,\n          9,\n          0\n        ],\n        \"semantic_type\": \"\",\n        \"description\": \"\"\n      }\n    },\n    {\n      \"column\": \"phone_gt\",\n      \"properties\": {\n        \"dtype\": \"number\",\n        \"std\": 0,\n        \"min\": 0,\n        \"max\": 0,\n        \"num_unique_values\": 1,\n        \"samples\": [\n          0\n        ],\n        \"semantic_type\": \"\",\n        \"description\": \"\"\n      }\n    },\n    {\n      \"column\": \"sleepy_gt\",\n      \"properties\": {\n        \"dtype\": \"number\",\n        \"std\": 0,\n        \"min\": 0,\n        \"max\": 0,\n        \"num_unique_values\": 1,\n        \"samples\": [\n          0\n        ],\n        \"semantic_type\": \"\",\n        \"description\": \"\"\n      }\n    },\n    {\n      \"column\": \"seat_gt\",\n      \"properties\": {\n        \"dtype\": \"number\",\n        \"std\": 0,\n        \"min\": 0,\n        \"max\": 0,\n        \"num_unique_values\": 1,\n        \"samples\": [\n          0\n        ],\n        \"semantic_type\": \"\",\n        \"description\": \"\"\n      }\n    }\n  ]\n}"
-            }
-          },
-          "metadata": {}
-        }
-      ]
-    },
-    {
-      "cell_type": "markdown",
-      "source": [
-        "# 개인화/적용"
-      ],
-      "metadata": {
-        "id": "qX-7hcQAZF9g"
-      }
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "# ========================================\n",
-        "# 1) 초기 안정 구간 기반 개인화 Baseline 계산\n",
-        "# ========================================\n",
-        "\n",
-        "def compute_personal_baseline_stability_filtered(\n",
-        "    segment_results,\n",
-        "    warmup_segments=120   # 5초 세그먼트 기준 약 10분 (5초 × 120 = 600초 = 10분)\n",
-        "):\n",
-        "    \"\"\"\n",
-        "    본 연구에서는 baseline을 단순히 초반 10분의 평균으로 정의하지 않고,\n",
-        "    **초기 구간에서 안정적 집중 상태(Stability-filtered segment)**만 추출하여\n",
-        "    posture·gaze baseline을 정교하게 구축한다.\n",
-        "\n",
-        "    안정 구간 추출 기준:\n",
-        "        - 과도한 시선 흔들림 (gaze jitter)\n",
-        "        - 지나치게 높은 blink spike\n",
-        "        - 과도한 졸음 (sleepy_flag)\n",
-        "        - phone 사용 의심 (phone_use 점수 낮음)\n",
-        "        - seat departure (자리 이탈)\n",
-        "        - 과도한 자세 변화\n",
-        "    \"\"\"\n",
-        "\n",
-        "    warm = segment_results[:min(warmup_segments, len(segment_results))]\n",
-        "\n",
-        "    head_vals = []\n",
-        "    shoulder_vals = []\n",
-        "    hand_face_vals = []\n",
-        "    blink_vals = []\n",
-        "    phone_vals = []\n",
-        "\n",
-        "    for seg in warm:\n",
-        "        sc  = seg['scores']\n",
-        "        raw = seg['raw']\n",
-        "        flg = seg['flags']\n",
-        "\n",
-        "        # ---------- Stability Filter ----------\n",
-        "        # 자리 이탈한 세그먼트 제외\n",
-        "        if flg['seat_departed']:\n",
-        "            continue\n",
-        "\n",
-        "        # blink spike (과도한 깜빡임)\n",
-        "        if raw['blink_rate_proxy'] > 0.25:\n",
-        "            continue\n",
-        "\n",
-        "        # 졸음 구간 제거 (sleepy_flag == 1)\n",
-        "        if raw['sleepy_flag'] == 1:\n",
-        "            continue\n",
-        "\n",
-        "        # 손-얼굴 거리 너무 가까움 (폰 사용 의심)\n",
-        "        if sc['hand_face'] < 0.25:\n",
-        "            continue\n",
-        "\n",
-        "        # 폰 사용 점수가 너무 낮음 (폰 사용 중)\n",
-        "        if sc['phone_use'] < 0.5:\n",
-        "            continue\n",
-        "\n",
-        "        # 고개가 과도하게 기울어진 구간\n",
-        "        if sc['head_angle'] < 0.3:  # 점수가 낮을수록 기울어진 것\n",
-        "            continue\n",
-        "\n",
-        "        # 어깨 틀어짐 과도\n",
-        "        if sc['shoulder_tilt'] < 0.3:\n",
-        "            continue\n",
-        "        # -------------------------------------\n",
-        "\n",
-        "        head_vals.append(sc['head_angle'])\n",
-        "        shoulder_vals.append(sc['shoulder_tilt'])\n",
-        "        hand_face_vals.append(sc['hand_face'])\n",
-        "        blink_vals.append(raw['blink_rate_proxy'])\n",
-        "        phone_vals.append(sc['phone_use'])\n",
-        "\n",
-        "    def safe_stats(arr, default_mean):\n",
-        "        if len(arr) == 0:\n",
-        "            return default_mean, 1e-4\n",
-        "        arr = np.array(arr, dtype=np.float32)\n",
-        "        return float(arr.mean()), float(arr.std() + 1e-4)\n",
-        "\n",
-        "    baseline = {\n",
-        "        'head_mean':     safe_stats(head_vals,     0.7)[0],   # 점수 기준 (높을수록 좋음)\n",
-        "        'head_std':      safe_stats(head_vals,     0.7)[1],\n",
-        "        'shoulder_mean': safe_stats(shoulder_vals, 0.7)[0],\n",
-        "        'shoulder_std':  safe_stats(shoulder_vals, 0.7)[1],\n",
-        "        'hand_mean':     safe_stats(hand_face_vals, 0.5)[0],\n",
-        "        'hand_std':      safe_stats(hand_face_vals, 0.5)[1],\n",
-        "        'blink_mean':    safe_stats(blink_vals,    0.05)[0],\n",
-        "        'blink_std':     safe_stats(blink_vals,    0.05)[1],\n",
-        "        'phone_mean':    safe_stats(phone_vals,    0.9)[0],\n",
-        "        'phone_std':     safe_stats(phone_vals,    0.9)[1],\n",
-        "        'num_stable_segments': len(head_vals)  # 안정 구간 개수 기록\n",
-        "    }\n",
-        "\n",
-        "    return baseline\n",
-        "\n",
-        "\n",
-        "# ========================================\n",
-        "# 2) Baseline 대비 변화량을 이용한 개인화 적용\n",
-        "# ========================================\n",
-        "\n",
-        "def apply_personalization_with_delta(segment_results, baseline):\n",
-        "    \"\"\"\n",
-        "    Baseline 대비 변화량(delta)을 활용해 개인화 집중도를 계산.\n",
-        "    변화량이 작을수록(=baseline과 비슷할수록) 집중도가 높다고 판단.\n",
-        "\n",
-        "    z = |x - μ| / σ 기반 안정성 점수:\n",
-        "        stability = exp( - z )\n",
-        "\n",
-        "    최종 개인화 점수 = 기존 final * 0.6 + 개인화 안정성 * 0.4\n",
-        "    \"\"\"\n",
-        "\n",
-        "    personalized = []\n",
-        "\n",
-        "    for seg in segment_results:\n",
-        "        sc  = seg['scores']\n",
-        "        raw = seg['raw']\n",
-        "        flg = seg['flags']\n",
-        "\n",
-        "        def z_score(x, mu, sigma):\n",
-        "            return abs(x - mu) / sigma\n",
-        "\n",
-        "        def stability(x, mu, sigma):\n",
-        "            z = z_score(x, mu, sigma)\n",
-        "            return float(np.exp(-z))  # z 클수록 빠르게 감점\n",
-        "\n",
-        "        # 각 feature별 안정성 점수 계산\n",
-        "        st_head    = stability(sc['head_angle'], baseline['head_mean'], baseline['head_std'])\n",
-        "        st_shoul   = stability(sc['shoulder_tilt'], baseline['shoulder_mean'], baseline['shoulder_std'])\n",
-        "        st_hand    = stability(sc['hand_face'], baseline['hand_mean'], baseline['hand_std'])\n",
-        "        st_blink   = stability(raw['blink_rate_proxy'], baseline['blink_mean'], baseline['blink_std'])\n",
-        "        st_phone   = stability(sc['phone_use'], baseline['phone_mean'], baseline['phone_std'])\n",
-        "\n",
-        "        # 개인화 안정성 종합 점수 (가중 평균)\n",
-        "        personal_stability = (\n",
-        "            0.25 * st_head +\n",
-        "            0.25 * st_shoul +\n",
-        "            0.20 * st_hand +\n",
-        "            0.15 * st_blink +\n",
-        "            0.15 * st_phone\n",
-        "        )\n",
-        "\n",
-        "        # 자리 이탈 시 패널티\n",
-        "        if flg['seat_departed']:\n",
-        "            personal_stability *= 0.3  # 70% 감점\n",
-        "\n",
-        "        # 졸음 감지 시 패널티\n",
-        "        if raw['sleepy_flag'] == 1:\n",
-        "            personal_stability *= 0.5  # 50% 감점\n",
-        "\n",
-        "        # 최종 개인화 점수 (기존 점수와 개인화 안정성 혼합)\n",
-        "        final_personal = 0.6 * sc['final'] + 0.4 * personal_stability\n",
-        "\n",
-        "        # 결과 복사 및 추가\n",
-        "        seg_new = seg.copy()\n",
-        "        seg_new['scores'] = seg['scores'].copy()\n",
-        "        seg_new['scores']['personalized'] = round(final_personal, 4)\n",
-        "        seg_new['scores']['personal_stability'] = round(personal_stability, 4)\n",
-        "        personalized.append(seg_new)\n",
-        "\n",
-        "    return personalized\n",
-        "\n",
-        "\n",
-        "# ========================================\n",
-        "# 3) 실행 예시\n",
-        "# ========================================\n",
-        "\n",
-        "# Step 1: 7-feature segment 점수 계산\n",
-        "seg_results = compute_segment_scores_7features(\n",
-        "    processed_frames=processed_frames,\n",
-        "    pose_keypoints=pose_keypoints,\n",
-        "    eyes_landmarks=eyes_landmarks,\n",
-        "    face_bboxes=face_bboxes,\n",
-        "    frame_sizes=frame_sizes,\n",
-        "    segment_size=segment_size,\n",
-        "    phone_bboxes=None,  # YOLO 등으로 폰 검출 결과 넣을 수 있음\n",
-        "    params={\n",
-        "        'time_decay_lambda': 0.08,\n",
-        "    }\n",
-        ")\n",
-        "\n",
-        "print(f\"총 {len(seg_results)}개 세그먼트 계산 완료\")\n",
-        "\n",
-        "# Step 2: 안정 구간 기반 개인화 baseline 계산\n",
-        "baseline = compute_personal_baseline_stability_filtered(\n",
-        "    segment_results=seg_results,\n",
-        "    warmup_segments=120    # 10분 기반 (120 segments × 5초 = 600초)\n",
-        ")\n",
-        "\n",
-        "print(\"\\n=== 개인화 Baseline ===\")\n",
-        "for key, val in baseline.items():\n",
-        "    print(f\"{key:20s}: {val:.4f}\")\n",
-        "\n",
-        "print(f\"\\n안정 구간 개수: {baseline['num_stable_segments']} / {min(120, len(seg_results))}\")\n",
-        "\n",
-        "# Step 3: Baseline 적용하여 개인화 점수 계산\n",
-        "personalized_segments = apply_personalization_with_delta(\n",
-        "    segment_results=seg_results,\n",
-        "    baseline=baseline\n",
-        ")\n",
-        "\n",
-        "# Step 4: 결과 확인\n",
-        "print(\"\\n=== 첫 10개 세그먼트 점수 비교 ===\")\n",
-        "print(\"Seg | Original | Personalized | Stability | Sleepy\")\n",
-        "print(\"-\" * 60)\n",
-        "for i, p in enumerate(personalized_segments[:10]):\n",
-        "    print(f\"{i:3d} | {p['scores']['final']:8.3f} | \"\n",
-        "          f\"{p['scores']['personalized']:12.3f} | \"\n",
-        "          f\"{p['scores']['personal_stability']:9.3f} | \"\n",
-        "          f\"{p['raw']['sleepy_flag']:6d}\")\n",
-        "\n",
-        "# Step 5: CSV 저장 (기존 수정 코드와 동일한 라벨 구조)\n",
-        "rows = []\n",
-        "for r in personalized_segments:\n",
-        "    s = r['scores']\n",
-        "    raw = r['raw']\n",
-        "    flg = r['flags']\n",
-        "\n",
-        "    # 기존 수정 코드의 CSV 라벨과 동일하게 구성\n",
-        "    row = {\n",
-        "        'segment_idx': r['segment_idx'],\n",
-        "        'phone_use': s['phone_use'],\n",
-        "        'seat_depart': s['seat_depart'],\n",
-        "        'head_angle': s['head_angle'],\n",
-        "        'shoulder_tilt': s['shoulder_tilt'],\n",
-        "        'hand_face': s['hand_face'],\n",
-        "        'blink': s['blink'],\n",
-        "        'perclos': s['perclos'],\n",
-        "        'final': s['final'],\n",
-        "        'personalized': s['personalized'],           # 개인화 점수 추가\n",
-        "        'personal_stability': s['personal_stability'], # 개인화 안정성 점수 추가\n",
-        "        'usage_ratio': raw['usage_ratio'],\n",
-        "        'sleepy_flag': raw['sleepy_flag'],\n",
-        "        'blink_rate_proxy': raw['blink_rate_proxy'],\n",
-        "        'EAR_baseline': raw['EAR_baseline'],\n",
-        "        'seat_departed': flg['seat_departed']\n",
-        "    }\n",
-        "    rows.append(row)\n",
-        "\n",
-        "df = pd.DataFrame(rows).round(3)\n",
-        "print(f\"\\n=== 첫 10개 세그먼트 데이터 ===\")\n",
-        "print(df.head(10).to_string(index=False))\n",
-        "\n",
-        "print(f\"\\n=== 전체 통계 ===\")\n",
-        "print(df[['final', 'personalized', 'personal_stability']].describe().round(3))\n",
-        "\n",
-        "# CSV 저장\n",
-        "output_path = \"/content/drive/MyDrive/ai_study_flow_tracker/labels_personalized_video_30.csv\"\n",
-        "df.to_csv(output_path, index=False, encoding=\"utf-8-sig\")\n",
-        "print(f\"\\n결과 저장 완료: {output_path}\")"
-      ],
-      "metadata": {
-        "colab": {
-          "base_uri": "https://localhost:8080/"
-        },
-        "id": "3HgFmwFeZJ05",
-        "outputId": "179a9dd5-45d8-4921-e18c-583440e4ea37"
-      },
-      "execution_count": null,
-      "outputs": [
-        {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "총 36개 세그먼트 계산 완료\n",
-            "\n",
-            "=== 개인화 Baseline ===\n",
-            "head_mean           : 0.7000\n",
-            "head_std            : 0.0001\n",
-            "shoulder_mean       : 0.7000\n",
-            "shoulder_std        : 0.0001\n",
-            "hand_mean           : 0.5000\n",
-            "hand_std            : 0.0001\n",
-            "blink_mean          : 0.0500\n",
-            "blink_std           : 0.0001\n",
-            "phone_mean          : 0.9000\n",
-            "phone_std           : 0.0001\n",
-            "num_stable_segments : 0.0000\n",
-            "\n",
-            "안정 구간 개수: 0 / 36\n",
-            "\n",
-            "=== 첫 10개 세그먼트 점수 비교 ===\n",
-            "Seg | Original | Personalized | Stability | Sleepy\n",
-            "------------------------------------------------------------\n",
-            "  0 |    0.763 |        0.458 |     0.000 |      0\n",
-            "  1 |    0.807 |        0.484 |     0.000 |      0\n",
-            "  2 |    0.600 |        0.360 |     0.000 |      1\n",
-            "  3 |    0.760 |        0.456 |     0.000 |      0\n",
-            "  4 |    0.760 |        0.456 |     0.000 |      0\n",
-            "  5 |    0.760 |        0.456 |     0.000 |      0\n",
-            "  6 |    0.760 |        0.456 |     0.000 |      0\n",
-            "  7 |    0.760 |        0.456 |     0.000 |      0\n",
-            "  8 |    0.760 |        0.456 |     0.000 |      0\n",
-            "  9 |    0.760 |        0.456 |     0.000 |      0\n",
-            "\n",
-            "=== 첫 10개 세그먼트 데이터 ===\n",
-            " segment_idx  phone_use  seat_depart  head_angle  shoulder_tilt  hand_face  blink  perclos  final  personalized  personal_stability  usage_ratio  sleepy_flag  blink_rate_proxy  EAR_baseline  seat_departed\n",
-            "           0        1.0          1.0       0.026            0.0      1.000    1.0      1.0  0.763         0.458                 0.0          0.0            0               0.0         0.275          False\n",
-            "           1        1.0          1.0       0.391            0.0      0.998    1.0      1.0  0.807         0.484                 0.0          0.0            0               0.0         0.275          False\n",
-            "           2        1.0          1.0       0.000            0.0      1.000    1.0      0.0  0.600         0.360                 0.0          0.0            1               0.0         0.275          False\n",
-            "           3        1.0          1.0       0.000            0.0      1.000    1.0      1.0  0.760         0.456                 0.0          0.0            0               0.0         0.275          False\n",
-            "           4        1.0          1.0       0.000            0.0      1.000    1.0      1.0  0.760         0.456                 0.0          0.0            0               0.0         0.275          False\n",
-            "           5        1.0          1.0       0.000            0.0      1.000    1.0      1.0  0.760         0.456                 0.0          0.0            0               0.0         0.275          False\n",
-            "           6        1.0          1.0       0.000            0.0      1.000    1.0      1.0  0.760         0.456                 0.0          0.0            0               0.0         0.275          False\n",
-            "           7        1.0          1.0       0.000            0.0      1.000    1.0      1.0  0.760         0.456                 0.0          0.0            0               0.0         0.275          False\n",
-            "           8        1.0          1.0       0.000            0.0      1.000    1.0      1.0  0.760         0.456                 0.0          0.0            0               0.0         0.275          False\n",
-            "           9        1.0          1.0       0.000            0.0      1.000    1.0      1.0  0.760         0.456                 0.0          0.0            0               0.0         0.275          False\n",
-            "\n",
-            "=== 전체 통계 ===\n",
-            "        final  personalized  personal_stability\n",
-            "count  36.000        36.000                36.0\n",
-            "mean    0.766         0.459                 0.0\n",
-            "std     0.047         0.028                 0.0\n",
-            "min     0.600         0.360                 0.0\n",
-            "25%     0.760         0.456                 0.0\n",
-            "50%     0.760         0.456                 0.0\n",
-            "75%     0.780         0.468                 0.0\n",
-            "max     0.827         0.496                 0.0\n",
-            "\n",
-            "결과 저장 완료: /content/drive/MyDrive/ai_study_flow_tracker/labels_personalized_video_30.csv\n"
-          ]
-        }
-      ]
-    },
-    {
-      "cell_type": "markdown",
-      "source": [
-        "# 자동/수동 라벨링 비교"
-      ],
-      "metadata": {
-        "id": "i-yO1VzPgYQ9"
-      }
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "import pandas as pd\n",
-        "import numpy as np\n",
-        "\n",
-        "# ============================\n",
-        "# 1) CSV 로드\n",
-        "# ============================\n",
-        "df_model = pd.read_csv(\"/content/drive/MyDrive/ai_study_flow_tracker/labels_personalized_video_30.csv\")\n",
-        "df_human = pd.read_csv(\"/content/human_labels.csv\")\n",
-        "\n",
-        "print(f\"모델 라벨: {len(df_model)}개 세그먼트\")\n",
-        "print(f\"사람 라벨: {len(df_human)}개 세그먼트\")\n",
-        "\n",
-        "# ============================\n",
-        "# 2) 모델 예측 기준 정의\n",
-        "# ============================\n",
-        "\n",
-        "# 🔥 핸드폰 사용 판단: phone_use 점수가 낮으면 폰 사용 중\n",
-        "# phone_use 점수: 높을수록 폰 안쓰는 것 (1.0 = 폰 안씀, 0.0 = 폰 사용)\n",
-        "# threshold: 0.7 미만이면 폰 사용으로 판단\n",
-        "df_model[\"pred_phone\"] = (df_model[\"phone_use\"] < 0.7).astype(int)\n",
-        "\n",
-        "# 🔥 졸음 판단: sleepy_flag 직접 사용 (이미 0 또는 1)\n",
-        "# sleepy_flag == 1: 졸음 감지됨 (70% eye closure 5초 지속 또는 head nod)\n",
-        "df_model[\"pred_sleepy\"] = df_model[\"sleepy_flag\"].astype(int)\n",
-        "\n",
-        "# 🔥 자리 이탈 판단: seat_departed 직접 사용 (이미 True/False)\n",
-        "df_model[\"pred_seat\"] = df_model[\"seat_departed\"].astype(int)\n",
-        "\n",
-        "print(\"\\n=== 모델 예측 분포 ===\")\n",
-        "print(f\"폰 사용 예측: {df_model['pred_phone'].sum()} / {len(df_model)} 세그먼트\")\n",
-        "print(f\"졸음 예측: {df_model['pred_sleepy'].sum()} / {len(df_model)} 세그먼트\")\n",
-        "print(f\"자리 이탈 예측: {df_model['pred_seat'].sum()} / {len(df_model)} 세그먼트\")\n",
-        "\n",
-        "\n",
-        "# ============================\n",
-        "# 3) segment_idx로 병합\n",
-        "# ============================\n",
-        "df_eval = df_model.merge(df_human, on=\"segment_idx\", how=\"inner\")\n",
-        "print(f\"\\n병합 결과: {len(df_eval)}개 세그먼트\")\n",
-        "\n",
-        "if len(df_eval) == 0:\n",
-        "    print(\"⚠️ 경고: 병합된 데이터가 없습니다. segment_idx가 일치하는지 확인하세요.\")\n",
-        "    print(\"모델 segment_idx 범위:\", df_model[\"segment_idx\"].min(), \"~\", df_model[\"segment_idx\"].max())\n",
-        "    print(\"사람 segment_idx 범위:\", df_human[\"segment_idx\"].min(), \"~\", df_human[\"segment_idx\"].max())\n",
-        "\n",
-        "\n",
-        "# ============================\n",
-        "# 4) 정답 여부 계산\n",
-        "# ============================\n",
-        "df_eval[\"phone_correct\"]  = (df_eval[\"pred_phone\"]  == df_eval[\"phone_gt\"]).astype(int)\n",
-        "df_eval[\"sleepy_correct\"] = (df_eval[\"pred_sleepy\"] == df_eval[\"sleepy_gt\"]).astype(int)\n",
-        "df_eval[\"seat_correct\"]   = (df_eval[\"pred_seat\"]   == df_eval[\"seat_gt\"]).astype(int)\n",
-        "\n",
-        "# 전체 정확도\n",
-        "phone_acc  = df_eval[\"phone_correct\"].mean()\n",
-        "sleepy_acc = df_eval[\"sleepy_correct\"].mean()\n",
-        "seat_acc   = df_eval[\"seat_correct\"].mean()\n",
-        "\n",
-        "print(\"\\n=== 정확도 (Accuracy) ===\")\n",
-        "print(f\"폰 사용: {phone_acc:.3f} ({df_eval['phone_correct'].sum()}/{len(df_eval)})\")\n",
-        "print(f\"졸음:   {sleepy_acc:.3f} ({df_eval['sleepy_correct'].sum()}/{len(df_eval)})\")\n",
-        "print(f\"자리 이탈: {seat_acc:.3f} ({df_eval['seat_correct'].sum()}/{len(df_eval)})\")\n",
-        "\n",
-        "\n",
-        "# ============================\n",
-        "# 5) TP/FP/FN/TN 케이스 분류\n",
-        "# ============================\n",
-        "def case(gt, pred):\n",
-        "    \"\"\"\n",
-        "    TP: True Positive  - 실제 1, 예측 1 (맞춤)\n",
-        "    FP: False Positive - 실제 0, 예측 1 (틀림 - 없는데 있다고 함)\n",
-        "    FN: False Negative - 실제 1, 예측 0 (틀림 - 있는데 없다고 함)\n",
-        "    TN: True Negative  - 실제 0, 예측 0 (맞춤)\n",
-        "    \"\"\"\n",
-        "    if gt == 1 and pred == 1: return \"TP\"\n",
-        "    if gt == 0 and pred == 1: return \"FP\"\n",
-        "    if gt == 1 and pred == 0: return \"FN\"\n",
-        "    return \"TN\"\n",
-        "\n",
-        "df_eval[\"phone_case\"]  = df_eval.apply(lambda r: case(r[\"phone_gt\"],  r[\"pred_phone\"]),  axis=1)\n",
-        "df_eval[\"sleepy_case\"] = df_eval.apply(lambda r: case(r[\"sleepy_gt\"], r[\"pred_sleepy\"]), axis=1)\n",
-        "df_eval[\"seat_case\"]   = df_eval.apply(lambda r: case(r[\"seat_gt\"],   r[\"pred_seat\"]),   axis=1)\n",
-        "\n",
-        "\n",
-        "# ============================\n",
-        "# 6) Confusion Matrix 출력\n",
-        "# ============================\n",
-        "def print_confusion_matrix(df, gt_col, pred_col, case_col, label):\n",
-        "    print(f\"\\n=== {label} Confusion Matrix ===\")\n",
-        "    print(f\"{'':8s} | Pred=0 | Pred=1\")\n",
-        "    print(\"-\" * 30)\n",
-        "\n",
-        "    tn = (df[case_col] == \"TN\").sum()\n",
-        "    fp = (df[case_col] == \"FP\").sum()\n",
-        "    fn = (df[case_col] == \"FN\").sum()\n",
-        "    tp = (df[case_col] == \"TP\").sum()\n",
-        "\n",
-        "    print(f\"GT=0    | {tn:6d} | {fp:6d}\")\n",
-        "    print(f\"GT=1    | {fn:6d} | {tp:6d}\")\n",
-        "\n",
-        "    # Precision, Recall, F1\n",
-        "    precision = tp / (tp + fp) if (tp + fp) > 0 else 0\n",
-        "    recall = tp / (tp + fn) if (tp + fn) > 0 else 0\n",
-        "    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0\n",
-        "\n",
-        "    print(f\"\\nPrecision: {precision:.3f}\")\n",
-        "    print(f\"Recall:    {recall:.3f}\")\n",
-        "    print(f\"F1-Score:  {f1:.3f}\")\n",
-        "\n",
-        "print_confusion_matrix(df_eval, \"phone_gt\", \"pred_phone\", \"phone_case\", \"폰 사용\")\n",
-        "print_confusion_matrix(df_eval, \"sleepy_gt\", \"pred_sleepy\", \"sleepy_case\", \"졸음\")\n",
-        "print_confusion_matrix(df_eval, \"seat_gt\", \"pred_seat\", \"seat_case\", \"자리 이탈\")\n",
-        "\n",
-        "\n",
-        "# ============================\n",
-        "# 7) 오분류 케이스 분석\n",
-        "# ============================\n",
-        "print(\"\\n=== 오분류 케이스 분석 ===\")\n",
-        "\n",
-        "# False Positive (없는데 있다고 판단)\n",
-        "phone_fp = df_eval[df_eval[\"phone_case\"] == \"FP\"]\n",
-        "sleepy_fp = df_eval[df_eval[\"sleepy_case\"] == \"FP\"]\n",
-        "seat_fp = df_eval[df_eval[\"seat_case\"] == \"FP\"]\n",
-        "\n",
-        "print(f\"\\n폰 사용 FP (실제 안쓰는데 쓴다고 판단): {len(phone_fp)}건\")\n",
-        "if len(phone_fp) > 0:\n",
-        "    print(phone_fp[[\"segment_idx\", \"phone_use\", \"hand_face\", \"pred_phone\", \"phone_gt\"]].head())\n",
-        "\n",
-        "print(f\"\\n졸음 FP (실제 안졸린데 졸린다고 판단): {len(sleepy_fp)}건\")\n",
-        "if len(sleepy_fp) > 0:\n",
-        "    print(sleepy_fp[[\"segment_idx\", \"perclos\", \"sleepy_flag\", \"EAR_baseline\", \"pred_sleepy\", \"sleepy_gt\"]].head())\n",
-        "\n",
-        "print(f\"\\n자리 이탈 FP (실제 안이탈했는데 이탈했다고 판단): {len(seat_fp)}건\")\n",
-        "if len(seat_fp) > 0:\n",
-        "    print(seat_fp[[\"segment_idx\", \"seat_departed\", \"pred_seat\", \"seat_gt\"]].head())\n",
-        "\n",
-        "# False Negative (있는데 없다고 판단)\n",
-        "phone_fn = df_eval[df_eval[\"phone_case\"] == \"FN\"]\n",
-        "sleepy_fn = df_eval[df_eval[\"sleepy_case\"] == \"FN\"]\n",
-        "seat_fn = df_eval[df_eval[\"seat_case\"] == \"FN\"]\n",
-        "\n",
-        "print(f\"\\n폰 사용 FN (실제 쓰는데 안쓴다고 판단): {len(phone_fn)}건\")\n",
-        "if len(phone_fn) > 0:\n",
-        "    print(phone_fn[[\"segment_idx\", \"phone_use\", \"hand_face\", \"pred_phone\", \"phone_gt\"]].head())\n",
-        "\n",
-        "print(f\"\\n졸음 FN (실제 졸린데 안졸린다고 판단): {len(sleepy_fn)}건\")\n",
-        "if len(sleepy_fn) > 0:\n",
-        "    print(sleepy_fn[[\"segment_idx\", \"perclos\", \"sleepy_flag\", \"EAR_baseline\", \"pred_sleepy\", \"sleepy_gt\"]].head())\n",
-        "\n",
-        "print(f\"\\n자리 이탈 FN (실제 이탈했는데 안했다고 판단): {len(seat_fn)}건\")\n",
-        "if len(seat_fn) > 0:\n",
-        "    print(seat_fn[[\"segment_idx\", \"seat_departed\", \"pred_seat\", \"seat_gt\"]].head())\n",
-        "\n",
-        "\n",
-        "# ============================\n",
-        "# 8) CSV 저장\n",
-        "# ============================\n",
-        "# 주요 컬럼만 선택해서 저장\n",
-        "output_cols = [\n",
-        "    \"segment_idx\",\n",
-        "    # 모델 원본 점수\n",
-        "    \"phone_use\", \"hand_face\", \"perclos\", \"sleepy_flag\", \"seat_departed\",\n",
-        "    \"final\", \"personalized\",\n",
-        "    # 모델 예측\n",
-        "    \"pred_phone\", \"pred_sleepy\", \"pred_seat\",\n",
-        "    # 사람 라벨\n",
-        "    \"phone_gt\", \"sleepy_gt\", \"seat_gt\",\n",
-        "    # 정답 여부\n",
-        "    \"phone_correct\", \"sleepy_correct\", \"seat_correct\",\n",
-        "    # 케이스 분류\n",
-        "    \"phone_case\", \"sleepy_case\", \"seat_case\"\n",
-        "]\n",
-        "\n",
-        "df_output = df_eval[output_cols]\n",
-        "df_output.to_csv(\"/content/drive/MyDrive/ai_study_flow_tracker/model_vs_human_compare.csv\",\n",
-        "                 index=False, encoding=\"utf-8-sig\")\n",
-        "\n",
-        "print(\"\\n✅ model_vs_human_compare.csv 저장 완료!\")\n",
-        "print(f\"저장된 컬럼: {', '.join(output_cols)}\")\n",
-        "print(f\"\\n첫 5개 세그먼트 미리보기:\")\n",
-        "print(df_output.head().to_string(index=False))"
-      ],
-      "metadata": {
-        "colab": {
-          "base_uri": "https://localhost:8080/"
-        },
-        "id": "RVcX0zMZgbKm",
-        "outputId": "8cc02c5c-f6a5-42c2-bd72-2c6b3a0fb462"
-      },
-      "execution_count": null,
-      "outputs": [
-        {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "모델 라벨: 36개 세그먼트\n",
-            "사람 라벨: 12개 세그먼트\n",
-            "\n",
-            "=== 모델 예측 분포 ===\n",
-            "폰 사용 예측: 0 / 36 세그먼트\n",
-            "졸음 예측: 2 / 36 세그먼트\n",
-            "자리 이탈 예측: 0 / 36 세그먼트\n",
-            "\n",
-            "병합 결과: 12개 세그먼트\n",
-            "\n",
-            "=== 정확도 (Accuracy) ===\n",
-            "폰 사용: 1.000 (12/12)\n",
-            "졸음:   0.917 (11/12)\n",
-            "자리 이탈: 1.000 (12/12)\n",
-            "\n",
-            "=== 폰 사용 Confusion Matrix ===\n",
-            "         | Pred=0 | Pred=1\n",
-            "------------------------------\n",
-            "GT=0    |     12 |      0\n",
-            "GT=1    |      0 |      0\n",
-            "\n",
-            "Precision: 0.000\n",
-            "Recall:    0.000\n",
-            "F1-Score:  0.000\n",
-            "\n",
-            "=== 졸음 Confusion Matrix ===\n",
-            "         | Pred=0 | Pred=1\n",
-            "------------------------------\n",
-            "GT=0    |     11 |      1\n",
-            "GT=1    |      0 |      0\n",
-            "\n",
-            "Precision: 0.000\n",
-            "Recall:    0.000\n",
-            "F1-Score:  0.000\n",
-            "\n",
-            "=== 자리 이탈 Confusion Matrix ===\n",
-            "         | Pred=0 | Pred=1\n",
-            "------------------------------\n",
-            "GT=0    |     12 |      0\n",
-            "GT=1    |      0 |      0\n",
-            "\n",
-            "Precision: 0.000\n",
-            "Recall:    0.000\n",
-            "F1-Score:  0.000\n",
-            "\n",
-            "=== 오분류 케이스 분석 ===\n",
-            "\n",
-            "폰 사용 FP (실제 안쓰는데 쓴다고 판단): 0건\n",
-            "\n",
-            "졸음 FP (실제 안졸린데 졸린다고 판단): 1건\n",
-            "   segment_idx  perclos  sleepy_flag  EAR_baseline  pred_sleepy  sleepy_gt\n",
-            "2            2      0.0            1         0.275            1          0\n",
-            "\n",
-            "자리 이탈 FP (실제 안이탈했는데 이탈했다고 판단): 0건\n",
-            "\n",
-            "폰 사용 FN (실제 쓰는데 안쓴다고 판단): 0건\n",
-            "\n",
-            "졸음 FN (실제 졸린데 안졸린다고 판단): 0건\n",
-            "\n",
-            "자리 이탈 FN (실제 이탈했는데 안했다고 판단): 0건\n",
-            "\n",
-            "✅ model_vs_human_compare.csv 저장 완료!\n",
-            "저장된 컬럼: segment_idx, phone_use, hand_face, perclos, sleepy_flag, seat_departed, final, personalized, pred_phone, pred_sleepy, pred_seat, phone_gt, sleepy_gt, seat_gt, phone_correct, sleepy_correct, seat_correct, phone_case, sleepy_case, seat_case\n",
-            "\n",
-            "첫 5개 세그먼트 미리보기:\n",
-            " segment_idx  phone_use  hand_face  perclos  sleepy_flag  seat_departed  final  personalized  pred_phone  pred_sleepy  pred_seat  phone_gt  sleepy_gt  seat_gt  phone_correct  sleepy_correct  seat_correct phone_case sleepy_case seat_case\n",
-            "           0        1.0      1.000      1.0            0          False  0.763         0.458           0            0          0         0          0        0              1               1             1         TN          TN        TN\n",
-            "           1        1.0      0.998      1.0            0          False  0.807         0.484           0            0          0         0          0        0              1               1             1         TN          TN        TN\n",
-            "           2        1.0      1.000      0.0            1          False  0.600         0.360           0            1          0         0          0        0              1               0             1         TN          FP        TN\n",
-            "           3        1.0      1.000      1.0            0          False  0.760         0.456           0            0          0         0          0        0              1               1             1         TN          TN        TN\n",
-            "           4        1.0      1.000      1.0            0          False  0.760         0.456           0            0          0         0          0        0              1               1             1         TN          TN        TN\n"
-          ]
-        }
-      ]
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "# ============================\n",
-        "# 🔥 최종 정확도(%) 요약 출력\n",
-        "# ============================\n",
-        "\n",
-        "phone_pct  = phone_acc * 100\n",
-        "sleepy_pct = sleepy_acc * 100\n",
-        "seat_pct   = seat_acc * 100\n",
-        "\n",
-        "overall_acc = (phone_acc + sleepy_acc + seat_acc) / 3\n",
-        "overall_pct = overall_acc * 100\n",
-        "\n",
-        "print(\"\\n===================================\")\n",
-        "print(\"📊 최종 Accuracy 요약\")\n",
-        "print(\"===================================\")\n",
-        "print(f\"📱 폰 사용 정확도: {phone_pct:.2f}%\")\n",
-        "print(f\"😪 졸음 정확도:     {sleepy_pct:.2f}%\")\n",
-        "print(f\"💺 자리 이탈 정확도: {seat_pct:.2f}%\")\n",
-        "print(\"-----------------------------------\")\n",
-        "print(f\"🔥 전체 평균 정확도: {overall_pct:.2f}%\")\n",
-        "print(\"===================================\\n\")\n"
-      ],
-      "metadata": {
-        "id": "7repGoj0ekW5",
-        "colab": {
-          "base_uri": "https://localhost:8080/"
-        },
-        "outputId": "401526ca-9678-4280-92bc-b3620e6828a4"
-      },
-      "execution_count": null,
-      "outputs": [
-        {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "\n",
-            "===================================\n",
-            "📊 최종 Accuracy 요약\n",
-            "===================================\n",
-            "📱 폰 사용 정확도: 100.00%\n",
-            "😪 졸음 정확도:     91.67%\n",
-            "💺 자리 이탈 정확도: 100.00%\n",
-            "-----------------------------------\n",
-            "🔥 전체 평균 정확도: 97.22%\n",
-            "===================================\n",
-            "\n"
-          ]
-        }
-      ]
-    }
-  ]
+    })
+
+  return results
+
+seg_results = compute_segment_scores(
+  processed_frames=processed_frames,
+  pose_keypoints=pose_keypoints,
+  eyes_landmarks=eyes_landmarks,
+  segment_size=segment_size,
+  params={
+    'time_decay_lambda': 0.08,
+    'gaze_mix': {'paper': 0.7, 'stability': 0.3},
+    'conc_minmax': (1.0, 10.0),  # 데이터 보고 튜닝 권장
+  }
+)
+
+print("5초 단위 final scores 예시:",
+      [round(r['scores']['final'], 3) for r in seg_results[:10]])
+
+# %%
+# ... (위 초기화 동일)
+
+processed_frames = []
+face_bboxes = []
+eyes_landmarks = []
+pose_keypoints = []
+frame_sizes = []   # ← 추가: (w,h) 저장
+
+for t_idx in range(num_frames):
+  t_sec = t_idx / target_fps
+  frame_rgb = clip.get_frame(t_sec)
+  frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+  h, w, _ = frame_bgr.shape
+
+  res_face = mp_face.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+  if not res_face.multi_face_landmarks:
+    continue
+
+  lm = res_face.multi_face_landmarks[0].landmark
+  x_coords = np.array([p.x for p in lm]); y_coords = np.array([p.y for p in lm])
+  xmin, xmax = int(x_coords.min()*w), int(x_coords.max()*w)
+  ymin, ymax = int(y_coords.min()*h), int(y_coords.max()*h)
+  xmin, ymin = max(0, xmin), max(0, ymin)
+  xmax, ymax = min(w-1, xmax), min(h-1, ymax)
+  if xmax <= xmin or ymax <= ymin:
+    continue
+
+  bbox = (xmin, ymin, xmax, ymax)
+  face_bboxes.append(bbox)
+  frame_sizes.append((w, h))   # ← 추가: 이 프레임의 원본 크기 기록
+
+  face_crop = frame_bgr[ymin:ymax, xmin:xmax]
+  if face_crop.size == 0:
+    continue
+  face_crop_resized = cv2.resize(face_crop, model_input_size)
+  face_crop_norm = (face_crop_resized.astype(np.float32)/127.5) - 1.0
+  processed_frames.append(face_crop_norm)
+
+  lm_np = np.array([[p.x*w, p.y*h] for p in lm], dtype=np.float32)
+  try:
+    eyeL = lm_np[LEFT_EYE_IDXS, :]
+    eyeR = lm_np[RIGHT_EYE_IDXS, :]
+    eyes_landmarks.append((eyeL, eyeR))
+  except Exception:
+    eyes_landmarks.append(None)
+
+  res_pose = mp_pose.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+  if res_pose.pose_landmarks:
+    vec = []
+    for lm_p in res_pose.pose_landmarks.landmark:
+      vec.extend([lm_p.x, lm_p.y, lm_p.z])  # MediaPipe Pose는 정규화 좌표
+    pose_keypoints.append(vec)
+  else:
+    pose_keypoints.append([0.0]*(33*3))
+
+processed_frames = np.array(processed_frames)
+pose_keypoints = np.array(pose_keypoints, dtype=np.float32)
+
+# %%
+# ----------------------------------------
+# BlazePose index mapping
+# ----------------------------------------
+POSE_IDX = {
+  'nose': 0,
+  'eye_l': 2, 'eye_r': 5,
+  'shoulder_l': 11, 'shoulder_r': 12,
+  'wrist_l': 15, 'wrist_r': 16,
+  'hip_l': 23, 'hip_r': 24
 }
+
+def get_pose_xy(pose_vec, idx, w, h):
+  base = idx * 3
+  if base+1 >= len(pose_vec):
+    return None
+  x_n, y_n = pose_vec[base], pose_vec[base+1]
+  if not (0 <= x_n <= 1 and 0 <= y_n <= 1):
+    return None
+  return (x_n * w, y_n * h)
+
+def center_of_bbox(b):
+  x1,y1,x2,y2 = b
+  return np.array([(x1+x2)/2, (y1+y2)/2], dtype=np.float32)
+
+def angle_from_horizontal(p_left, p_right):
+  v = np.array(p_right) - np.array(p_left)
+  return abs(np.arctan2(v[1], v[0]))
+
+def perclos(ear_series, ear_thresh=0.21):
+  ear_series = np.array(ear_series, dtype=np.float32)
+  valid = np.isfinite(ear_series)
+  if valid.sum()==0: return np.nan
+  return float((ear_series[valid] < ear_thresh).mean())
+
+
+# ----------------------------------------
+# 업그레이드 졸음 기능 (Baseline EAR + 70% closure + 5초 지속 + head nod)
+# ----------------------------------------
+def compute_EAR_baseline(ear_series, min_samples=30):
+  ear_series = np.array(ear_series)
+  ear_series = ear_series[np.isfinite(ear_series)]
+  if len(ear_series) < min_samples:
+    return np.median(ear_series) if len(ear_series)>0 else 0.25
+  return np.median(ear_series[:min_samples])
+
+def is_eye_closure(ear, ear_baseline, ratio=0.30):
+  return ear < (ear_baseline * ratio)
+
+
+# ----------------------------------------
+# segment scoring
+# ----------------------------------------
+def compute_segment_scores_7features(
+        processed_frames,
+        pose_keypoints,
+        eyes_landmarks,
+        face_bboxes,
+        frame_sizes,
+        segment_size,
+        phone_bboxes=None,
+        ref_center=None,
+        ref_radius=None,
+        params=None
+):
+
+  PHONE_USE_THRESH = 25.0
+  T = len(processed_frames)
+  num_segments = T // segment_size
+  results = []
+
+  # 기본 파라미터
+  P = {
+    'ear_thresh': 0.21,
+    'time_decay_lambda': 0.08,
+    'norm': {
+      'head_angle_rad':  (0.0, 0.35),
+      'shoulder_tilt':   (0.0, 0.25),
+      'hand_face_dist':  (30.0, 200.0),
+      'blink_rate_proxy':(0.02, 0.30),
+      'perclos':         (0.00, 0.35)
+    },
+    'w': {
+      'phone_use':    0.16,
+      'seat_depart':  0.12,
+      'head_angle':   0.12,
+      'shoulder_tilt':0.12,
+      'hand_face':    0.16,
+      'blink':        0.16,
+      'perclos':      0.16
+    },
+    'seat_departure_penalty': 0.0
+  }
+  if params:
+    for k,v in params.items():
+      if k in P and isinstance(v,dict): P[k].update(v)
+      else: P[k]=v
+
+  # 기준점 자동 설정
+  if ref_center is None or ref_radius is None:
+    fcs = [center_of_bbox(b) for b in face_bboxes[:min(len(face_bboxes), max(segment_size, 30))] if b is not None]
+    if len(fcs)>=3:
+      ref_center = tuple(np.median(np.stack(fcs, axis=0),axis=0))
+      hs=[(b[3]-b[1]) for b in face_bboxes[:min(len(face_bboxes),max(segment_size,30))] if b is not None]
+      ref_radius = float(max(60.0, 2*np.median(hs))) if hs else 120.0
+    else:
+      ref_center=(0,0); ref_radius=120
+
+  W = P['w']
+
+  # EAR baseline 저장용
+  global EAR_baseline_global
+  baseline_buffer = []
+  EAR_baseline_global = 0.25
+
+  fps = 30  # 영상 FPS (필요시 수정)
+
+  for seg_idx in range(num_segments):
+    s = seg_idx * segment_size
+    e = s + segment_size
+    wdec = time_decay_weights(segment_size, lam=P['time_decay_lambda'])
+
+    # 누적
+    phone_use_flags=[]
+    head_angles=[]
+    shoulder_tilts=[]
+    hand_face_scores=[]
+    seat_flags=[]
+    ear_series=[]
+    blink_transitions=0
+    prev_closed=None
+
+    closure_frames=0
+    sleepy_flags=[]
+
+    for t in range(s, e):
+      w,h = frame_sizes[t]
+      fb = face_bboxes[t]
+      fc = center_of_bbox(fb) if fb is not None else None
+
+      # ---------------------
+      # 1) 폰 사용 (손-폰 거리)
+      # ---------------------
+      if phone_bboxes is not None and phone_bboxes[t] is not None:
+        p = pose_keypoints[t]
+        hand_center=None
+        if p is not None:
+          wL=get_pose_xy(p,POSE_IDX['wrist_l'],w,h)
+          wR=get_pose_xy(p,POSE_IDX['wrist_r'],w,h)
+          ws=[x for x in (wL,wR) if x is not None]
+          if ws:
+            hand_center=np.mean(np.array(ws),axis=0)
+
+        if hand_center is not None:
+          d_hp = np.linalg.norm(center_of_bbox(phone_bboxes[t]) - hand_center)
+          phone_use_flags.append(d_hp < PHONE_USE_THRESH)
+        else:
+          phone_use_flags.append(False)
+      else:
+        phone_use_flags.append(False)
+
+      # ---------------------
+      # 2) 고개 각도
+      # ---------------------
+      if eyes_landmarks[t] is not None:
+        eyeL,eyeR = eyes_landmarks[t]
+        cenL=eyeL.mean(axis=0); cenR=eyeR.mean(axis=0)
+        head_angles.append(angle_from_horizontal(cenL,cenR))
+
+      # ---------------------
+      # 3) 어깨 기울기 + 손 얼굴 거리 + 자리 이탈
+      # ---------------------
+      p = pose_keypoints[t]
+      if p is not None:
+        sL=get_pose_xy(p,POSE_IDX['shoulder_l'],w,h)
+        sR=get_pose_xy(p,POSE_IDX['shoulder_r'],w,h)
+        if sL and sR:
+          shoulder_tilts.append(angle_from_horizontal(sL,sR))
+
+        if fc is not None:
+          wL=get_pose_xy(p,POSE_IDX['wrist_l'],w,h)
+          wR=get_pose_xy(p,POSE_IDX['wrist_r'],w,h)
+          ws=[x for x in (wL,wR) if x is not None]
+          if ws:
+            hand_center=np.mean(np.array(ws),axis=0)
+            d_hf=np.linalg.norm(hand_center-fc)
+            hand_face_scores.append(to_score(d_hf,*P['norm']['hand_face_dist'],small_is_good=False))
+
+        nose=get_pose_xy(p,POSE_IDX['nose'],w,h)
+        if nose is None:
+          hl=get_pose_xy(p,POSE_IDX['hip_l'],w,h)
+          hr=get_pose_xy(p,POSE_IDX['hip_r'],w,h)
+          nose = tuple(np.mean([hl,hr],axis=0)) if (hl and hr) else None
+
+        if nose is not None:
+          dist=np.linalg.norm(np.array(nose)-np.array(ref_center))
+          seat_flags.append(dist>ref_radius)
+
+      # -----------------------------------------
+      # 4) ✨ 업그레이드된 EAR 기반 졸음 탐지
+      # -----------------------------------------
+      if eyes_landmarks[t] is not None:
+        try:
+          eyeL,eyeR = eyes_landmarks[t]
+          earL=eye_aspect_ratio_6pts(eyeL)
+          earR=eye_aspect_ratio_6pts(eyeR)
+          ear=0.5*(earL+earR)
+          ear_series.append(ear)
+
+          # baseline 초기 구간 모으기
+          if seg_idx==0 and t<40:
+            baseline_buffer.append(ear)
+
+          # baseline 계산(첫 세그먼트 끝에서)
+          if seg_idx==0 and t==e-1:
+            EAR_baseline = compute_EAR_baseline(baseline_buffer)
+            EAR_baseline_global = EAR_baseline
+          else:
+            EAR_baseline = EAR_baseline_global
+
+          # 70% closure
+          closed_70 = is_eye_closure(ear, EAR_baseline, ratio=0.30)
+
+          # closure duration
+          if closed_70: closure_frames += 1
+          else: closure_frames = 0
+
+          closure_long = (closure_frames >= int(5 * fps))
+
+          # head nod
+          head_nod=False
+          if len(head_angles)>=3:
+            head_nod = (head_angles[-1]-head_angles[-3] > 0.15)
+
+          sleepy_flag = closure_long or head_nod
+          sleepy_flags.append(sleepy_flag)
+
+        except:
+          ear_series.append(np.nan)
+
+    # -------------------------------
+    # 점수 계산
+    # -------------------------------
+    usage_ratio = sum(phone_use_flags)/len(phone_use_flags)
+    phone_use_score = 1.0 - usage_ratio
+
+    seat_departed = any(seat_flags)
+    seat_depart_score = 0.0 if seat_departed else 1.0
+
+    if head_angles:
+      ha=np.array(head_angles)
+      head_angle_score=to_score(ha.mean(),*P['norm']['head_angle_rad'],small_is_good=True)
+    else: head_angle_score=0.5
+
+    if shoulder_tilts:
+      st=np.array(shoulder_tilts)
+      shoulder_tilt_score=to_score(st.mean(),*P['norm']['shoulder_tilt'],small_is_good=True)
+    else: shoulder_tilt_score=0.5
+
+    hand_face_score = np.mean(hand_face_scores) if hand_face_scores else 0.5
+
+    blink_rate_proxy = blink_transitions/max(1,(e-s))
+    blink_score=to_score(blink_rate_proxy,*P['norm']['blink_rate_proxy'],small_is_good=True)
+
+    # ✨ 업그레이드된 졸음 score
+    segment_sleepy = any(sleepy_flags)
+    perclos_score = 1.0 - (1.0 if segment_sleepy else 0.0)
+
+    final_score = (
+            W['phone_use']*phone_use_score +
+            W['seat_depart']*seat_depart_score +
+            W['head_angle']*head_angle_score +
+            W['shoulder_tilt']*shoulder_tilt_score +
+            W['hand_face']*hand_face_score +
+            W['blink']*blink_score +
+            W['perclos']*perclos_score
+    )
+
+    results.append({
+      'segment_idx': seg_idx,
+      'scores': {
+        'phone_use': round(phone_use_score,4),
+        'seat_depart': round(seat_depart_score,4),
+        'head_angle': round(head_angle_score,4),
+        'shoulder_tilt': round(shoulder_tilt_score,4),
+        'hand_face': round(hand_face_score,4),
+        'blink': round(blink_score,4),
+        'perclos': round(perclos_score,4),
+        'final': round(final_score,4)
+      },
+      'raw': {
+        'usage_ratio': round(usage_ratio,4),
+        'sleepy_flag': int(segment_sleepy),
+        'blink_rate_proxy': round(blink_rate_proxy,5),
+        'EAR_baseline': round(EAR_baseline,4)
+      },
+      'flags': {
+        'seat_departed': seat_departed
+      }
+    })
+
+  return results
+
+# %%
+!pip install ipywidgets
+from IPython.display import display, HTML, clear_output
+import ipywidgets as widgets
+import pandas as pd
+import base64
+import subprocess
+
+def display_video_player(video_path, start_sec, end_sec):
+  seg_path = f"seg_{start_sec}_{end_sec}.mp4"
+  duration = end_sec - start_sec
+
+  cmd = f"ffmpeg -y -ss {start_sec} -i '{video_path}' -t {duration} -c copy {seg_path}"
+  subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+  video = open(seg_path, "rb").read()
+  b64 = base64.b64encode(video).decode()
+
+  html = f"""
+    <video width="480" controls autoplay>
+        <source src="data:video/mp4;base64,{b64}" type="video/mp4">
+    </video>
+    """
+  return HTML(html)
+video_path = "/content/drive/MyDrive/videos/video_data1_kimnamwoo.mp4"    # 너의 영상 경로
+segment_length = 10
+video_duration = 120                 # 너의 영상 길이로 수정
+num_segments = video_duration // segment_length
+
+human_labels = []
+current_seg = 0
+
+phone_label = widgets.ToggleButtons(
+  options=[("Yes",1), ("No",0)], description="📱 핸드폰?"
+)
+sleepy_label = widgets.ToggleButtons(
+  options=[("Yes",1), ("No",0)], description="😪 졸음?"
+)
+seat_label = widgets.ToggleButtons(
+  options=[("Yes",1), ("No",0)], description="🚶 자리이탈?"
+)
+
+save_button = widgets.Button(
+  description="저장하고 다음 ▶",
+  button_style="success"
+)
+
+ui_output = widgets.Output()
+def show_segment(seg_idx):
+  start = seg_idx * segment_length
+  end = (seg_idx + 1) * segment_length
+
+  clear_output()
+
+  print(f"=== Segment {seg_idx} ({start}초 ~ {end}초) ===\n")
+  display(display_video_player(video_path, start, end))
+  display(phone_label, sleepy_label, seat_label, save_button, ui_output)
+
+
+def on_save_clicked(b):
+  global current_seg
+
+  with ui_output:
+    clear_output()
+    print(f"Segment {current_seg} 저장됨.")
+
+  # 데이터 저장
+  human_labels.append({
+    "segment_idx": current_seg,
+    "phone_gt": phone_label.value,
+    "sleepy_gt": sleepy_label.value,
+    "seat_gt": seat_label.value,
+  })
+
+  current_seg += 1
+
+  if current_seg >= num_segments:
+    df = pd.DataFrame(human_labels)
+    df.to_csv("human_labels.csv", index=False)
+
+    clear_output()
+    print("🎉 모든 레이블 저장 완료!")
+    display(df)
+    return
+
+  # 다음 세그먼트로 이동
+  show_segment(current_seg)
+
+
+save_button.on_click(on_save_clicked)
+show_segment(0)
+
+# %% [markdown]
+# # 개인화/적용
+
+# %%
+# ========================================
+# 1) 초기 안정 구간 기반 개인화 Baseline 계산
+# ========================================
+
+def compute_personal_baseline_stability_filtered(
+        segment_results,
+        warmup_segments=120   # 5초 세그먼트 기준 약 10분 (5초 × 120 = 600초 = 10분)
+):
+  """
+  본 연구에서는 baseline을 단순히 초반 10분의 평균으로 정의하지 않고,
+  **초기 구간에서 안정적 집중 상태(Stability-filtered segment)**만 추출하여
+  posture·gaze baseline을 정교하게 구축한다.
+
+  안정 구간 추출 기준:
+      - 과도한 시선 흔들림 (gaze jitter)
+      - 지나치게 높은 blink spike
+      - 과도한 졸음 (sleepy_flag)
+      - phone 사용 의심 (phone_use 점수 낮음)
+      - seat departure (자리 이탈)
+      - 과도한 자세 변화
+  """
+
+  warm = segment_results[:min(warmup_segments, len(segment_results))]
+
+  head_vals = []
+  shoulder_vals = []
+  hand_face_vals = []
+  blink_vals = []
+  phone_vals = []
+
+  for seg in warm:
+    sc  = seg['scores']
+    raw = seg['raw']
+    flg = seg['flags']
+
+    # ---------- Stability Filter ----------
+    # 자리 이탈한 세그먼트 제외
+    if flg['seat_departed']:
+      continue
+
+    # blink spike (과도한 깜빡임)
+    if raw['blink_rate_proxy'] > 0.25:
+      continue
+
+    # 졸음 구간 제거 (sleepy_flag == 1)
+    if raw['sleepy_flag'] == 1:
+      continue
+
+    # 손-얼굴 거리 너무 가까움 (폰 사용 의심)
+    if sc['hand_face'] < 0.25:
+      continue
+
+    # 폰 사용 점수가 너무 낮음 (폰 사용 중)
+    if sc['phone_use'] < 0.5:
+      continue
+
+    # 고개가 과도하게 기울어진 구간
+    if sc['head_angle'] < 0.3:  # 점수가 낮을수록 기울어진 것
+      continue
+
+    # 어깨 틀어짐 과도
+    if sc['shoulder_tilt'] < 0.3:
+      continue
+    # -------------------------------------
+
+    head_vals.append(sc['head_angle'])
+    shoulder_vals.append(sc['shoulder_tilt'])
+    hand_face_vals.append(sc['hand_face'])
+    blink_vals.append(raw['blink_rate_proxy'])
+    phone_vals.append(sc['phone_use'])
+
+  def safe_stats(arr, default_mean):
+    if len(arr) == 0:
+      return default_mean, 1e-4
+    arr = np.array(arr, dtype=np.float32)
+    return float(arr.mean()), float(arr.std() + 1e-4)
+
+  baseline = {
+    'head_mean':     safe_stats(head_vals,     0.7)[0],   # 점수 기준 (높을수록 좋음)
+    'head_std':      safe_stats(head_vals,     0.7)[1],
+    'shoulder_mean': safe_stats(shoulder_vals, 0.7)[0],
+    'shoulder_std':  safe_stats(shoulder_vals, 0.7)[1],
+    'hand_mean':     safe_stats(hand_face_vals, 0.5)[0],
+    'hand_std':      safe_stats(hand_face_vals, 0.5)[1],
+    'blink_mean':    safe_stats(blink_vals,    0.05)[0],
+    'blink_std':     safe_stats(blink_vals,    0.05)[1],
+    'phone_mean':    safe_stats(phone_vals,    0.9)[0],
+    'phone_std':     safe_stats(phone_vals,    0.9)[1],
+    'num_stable_segments': len(head_vals)  # 안정 구간 개수 기록
+  }
+
+  return baseline
+
+
+# ========================================
+# 2) Baseline 대비 변화량을 이용한 개인화 적용
+# ========================================
+
+def apply_personalization_with_delta(segment_results, baseline):
+  """
+  Baseline 대비 변화량(delta)을 활용해 개인화 집중도를 계산.
+  변화량이 작을수록(=baseline과 비슷할수록) 집중도가 높다고 판단.
+
+  z = |x - μ| / σ 기반 안정성 점수:
+      stability = exp( - z )
+
+  최종 개인화 점수 = 기존 final * 0.6 + 개인화 안정성 * 0.4
+  """
+
+  personalized = []
+
+  for seg in segment_results:
+    sc  = seg['scores']
+    raw = seg['raw']
+    flg = seg['flags']
+
+    def z_score(x, mu, sigma):
+      return abs(x - mu) / sigma
+
+    def stability(x, mu, sigma):
+      z = z_score(x, mu, sigma)
+      return float(np.exp(-z))  # z 클수록 빠르게 감점
+
+    # 각 feature별 안정성 점수 계산
+    st_head    = stability(sc['head_angle'], baseline['head_mean'], baseline['head_std'])
+    st_shoul   = stability(sc['shoulder_tilt'], baseline['shoulder_mean'], baseline['shoulder_std'])
+    st_hand    = stability(sc['hand_face'], baseline['hand_mean'], baseline['hand_std'])
+    st_blink   = stability(raw['blink_rate_proxy'], baseline['blink_mean'], baseline['blink_std'])
+    st_phone   = stability(sc['phone_use'], baseline['phone_mean'], baseline['phone_std'])
+
+    # 개인화 안정성 종합 점수 (가중 평균)
+    personal_stability = (
+            0.25 * st_head +
+            0.25 * st_shoul +
+            0.20 * st_hand +
+            0.15 * st_blink +
+            0.15 * st_phone
+    )
+
+    # 자리 이탈 시 패널티
+    if flg['seat_departed']:
+      personal_stability *= 0.3  # 70% 감점
+
+    # 졸음 감지 시 패널티
+    if raw['sleepy_flag'] == 1:
+      personal_stability *= 0.5  # 50% 감점
+
+    # 최종 개인화 점수 (기존 점수와 개인화 안정성 혼합)
+    final_personal = 0.6 * sc['final'] + 0.4 * personal_stability
+
+    # 결과 복사 및 추가
+    seg_new = seg.copy()
+    seg_new['scores'] = seg['scores'].copy()
+    seg_new['scores']['personalized'] = round(final_personal, 4)
+    seg_new['scores']['personal_stability'] = round(personal_stability, 4)
+    personalized.append(seg_new)
+
+  return personalized
+
+
+# ========================================
+# 3) 실행 예시
+# ========================================
+
+# Step 1: 7-feature segment 점수 계산
+seg_results = compute_segment_scores_7features(
+  processed_frames=processed_frames,
+  pose_keypoints=pose_keypoints,
+  eyes_landmarks=eyes_landmarks,
+  face_bboxes=face_bboxes,
+  frame_sizes=frame_sizes,
+  segment_size=segment_size,
+  phone_bboxes=None,  # YOLO 등으로 폰 검출 결과 넣을 수 있음
+  params={
+    'time_decay_lambda': 0.08,
+  }
+)
+
+print(f"총 {len(seg_results)}개 세그먼트 계산 완료")
+
+# Step 2: 안정 구간 기반 개인화 baseline 계산
+baseline = compute_personal_baseline_stability_filtered(
+  segment_results=seg_results,
+  warmup_segments=120    # 10분 기반 (120 segments × 5초 = 600초)
+)
+
+print("\n=== 개인화 Baseline ===")
+for key, val in baseline.items():
+  print(f"{key:20s}: {val:.4f}")
+
+print(f"\n안정 구간 개수: {baseline['num_stable_segments']} / {min(120, len(seg_results))}")
+
+# Step 3: Baseline 적용하여 개인화 점수 계산
+personalized_segments = apply_personalization_with_delta(
+  segment_results=seg_results,
+  baseline=baseline
+)
+
+# Step 4: 결과 확인
+print("\n=== 첫 10개 세그먼트 점수 비교 ===")
+print("Seg | Original | Personalized | Stability | Sleepy")
+print("-" * 60)
+for i, p in enumerate(personalized_segments[:10]):
+  print(f"{i:3d} | {p['scores']['final']:8.3f} | "
+        f"{p['scores']['personalized']:12.3f} | "
+        f"{p['scores']['personal_stability']:9.3f} | "
+        f"{p['raw']['sleepy_flag']:6d}")
+
+# Step 5: CSV 저장 (기존 수정 코드와 동일한 라벨 구조)
+rows = []
+for r in personalized_segments:
+  s = r['scores']
+  raw = r['raw']
+  flg = r['flags']
+
+  # 기존 수정 코드의 CSV 라벨과 동일하게 구성
+  row = {
+    'segment_idx': r['segment_idx'],
+    'phone_use': s['phone_use'],
+    'seat_depart': s['seat_depart'],
+    'head_angle': s['head_angle'],
+    'shoulder_tilt': s['shoulder_tilt'],
+    'hand_face': s['hand_face'],
+    'blink': s['blink'],
+    'perclos': s['perclos'],
+    'final': s['final'],
+    'personalized': s['personalized'],           # 개인화 점수 추가
+    'personal_stability': s['personal_stability'], # 개인화 안정성 점수 추가
+    'usage_ratio': raw['usage_ratio'],
+    'sleepy_flag': raw['sleepy_flag'],
+    'blink_rate_proxy': raw['blink_rate_proxy'],
+    'EAR_baseline': raw['EAR_baseline'],
+    'seat_departed': flg['seat_departed']
+  }
+  rows.append(row)
+
+df = pd.DataFrame(rows).round(3)
+print(f"\n=== 첫 10개 세그먼트 데이터 ===")
+print(df.head(10).to_string(index=False))
+
+print(f"\n=== 전체 통계 ===")
+print(df[['final', 'personalized', 'personal_stability']].describe().round(3))
+
+# CSV 저장
+output_path = "/content/drive/MyDrive/ai_study_flow_tracker/labels_personalized_video_30.csv"
+df.to_csv(output_path, index=False, encoding="utf-8-sig")
+print(f"\n결과 저장 완료: {output_path}")
+
+# %% [markdown]
+# # 자동/수동 라벨링 비교
+
+# %%
+import pandas as pd
+import numpy as np
+
+# ============================
+# 1) CSV 로드
+# ============================
+df_model = pd.read_csv("/content/drive/MyDrive/ai_study_flow_tracker/labels_personalized_video_30.csv")
+df_human = pd.read_csv("/content/human_labels.csv")
+
+print(f"모델 라벨: {len(df_model)}개 세그먼트")
+print(f"사람 라벨: {len(df_human)}개 세그먼트")
+
+# ============================
+# 2) 모델 예측 기준 정의
+# ============================
+
+# 🔥 핸드폰 사용 판단: phone_use 점수가 낮으면 폰 사용 중
+# phone_use 점수: 높을수록 폰 안쓰는 것 (1.0 = 폰 안씀, 0.0 = 폰 사용)
+# threshold: 0.7 미만이면 폰 사용으로 판단
+df_model["pred_phone"] = (df_model["phone_use"] < 0.7).astype(int)
+
+# 🔥 졸음 판단: sleepy_flag 직접 사용 (이미 0 또는 1)
+# sleepy_flag == 1: 졸음 감지됨 (70% eye closure 5초 지속 또는 head nod)
+df_model["pred_sleepy"] = df_model["sleepy_flag"].astype(int)
+
+# 🔥 자리 이탈 판단: seat_departed 직접 사용 (이미 True/False)
+df_model["pred_seat"] = df_model["seat_departed"].astype(int)
+
+print("\n=== 모델 예측 분포 ===")
+print(f"폰 사용 예측: {df_model['pred_phone'].sum()} / {len(df_model)} 세그먼트")
+print(f"졸음 예측: {df_model['pred_sleepy'].sum()} / {len(df_model)} 세그먼트")
+print(f"자리 이탈 예측: {df_model['pred_seat'].sum()} / {len(df_model)} 세그먼트")
+
+
+# ============================
+# 3) segment_idx로 병합
+# ============================
+df_eval = df_model.merge(df_human, on="segment_idx", how="inner")
+print(f"\n병합 결과: {len(df_eval)}개 세그먼트")
+
+if len(df_eval) == 0:
+  print("⚠️ 경고: 병합된 데이터가 없습니다. segment_idx가 일치하는지 확인하세요.")
+  print("모델 segment_idx 범위:", df_model["segment_idx"].min(), "~", df_model["segment_idx"].max())
+  print("사람 segment_idx 범위:", df_human["segment_idx"].min(), "~", df_human["segment_idx"].max())
+
+
+# ============================
+# 4) 정답 여부 계산
+# ============================
+df_eval["phone_correct"]  = (df_eval["pred_phone"]  == df_eval["phone_gt"]).astype(int)
+df_eval["sleepy_correct"] = (df_eval["pred_sleepy"] == df_eval["sleepy_gt"]).astype(int)
+df_eval["seat_correct"]   = (df_eval["pred_seat"]   == df_eval["seat_gt"]).astype(int)
+
+# 전체 정확도
+phone_acc  = df_eval["phone_correct"].mean()
+sleepy_acc = df_eval["sleepy_correct"].mean()
+seat_acc   = df_eval["seat_correct"].mean()
+
+print("\n=== 정확도 (Accuracy) ===")
+print(f"폰 사용: {phone_acc:.3f} ({df_eval['phone_correct'].sum()}/{len(df_eval)})")
+print(f"졸음:   {sleepy_acc:.3f} ({df_eval['sleepy_correct'].sum()}/{len(df_eval)})")
+print(f"자리 이탈: {seat_acc:.3f} ({df_eval['seat_correct'].sum()}/{len(df_eval)})")
+
+
+# ============================
+# 5) TP/FP/FN/TN 케이스 분류
+# ============================
+def case(gt, pred):
+  """
+  TP: True Positive  - 실제 1, 예측 1 (맞춤)
+  FP: False Positive - 실제 0, 예측 1 (틀림 - 없는데 있다고 함)
+  FN: False Negative - 실제 1, 예측 0 (틀림 - 있는데 없다고 함)
+  TN: True Negative  - 실제 0, 예측 0 (맞춤)
+  """
+  if gt == 1 and pred == 1: return "TP"
+  if gt == 0 and pred == 1: return "FP"
+  if gt == 1 and pred == 0: return "FN"
+  return "TN"
+
+df_eval["phone_case"]  = df_eval.apply(lambda r: case(r["phone_gt"],  r["pred_phone"]),  axis=1)
+df_eval["sleepy_case"] = df_eval.apply(lambda r: case(r["sleepy_gt"], r["pred_sleepy"]), axis=1)
+df_eval["seat_case"]   = df_eval.apply(lambda r: case(r["seat_gt"],   r["pred_seat"]),   axis=1)
+
+
+# ============================
+# 6) Confusion Matrix 출력
+# ============================
+def print_confusion_matrix(df, gt_col, pred_col, case_col, label):
+  print(f"\n=== {label} Confusion Matrix ===")
+  print(f"{'':8s} | Pred=0 | Pred=1")
+  print("-" * 30)
+
+  tn = (df[case_col] == "TN").sum()
+  fp = (df[case_col] == "FP").sum()
+  fn = (df[case_col] == "FN").sum()
+  tp = (df[case_col] == "TP").sum()
+
+  print(f"GT=0    | {tn:6d} | {fp:6d}")
+  print(f"GT=1    | {fn:6d} | {tp:6d}")
+
+  # Precision, Recall, F1
+  precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+  recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+  f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+  print(f"\nPrecision: {precision:.3f}")
+  print(f"Recall:    {recall:.3f}")
+  print(f"F1-Score:  {f1:.3f}")
+
+print_confusion_matrix(df_eval, "phone_gt", "pred_phone", "phone_case", "폰 사용")
+print_confusion_matrix(df_eval, "sleepy_gt", "pred_sleepy", "sleepy_case", "졸음")
+print_confusion_matrix(df_eval, "seat_gt", "pred_seat", "seat_case", "자리 이탈")
+
+
+# ============================
+# 7) 오분류 케이스 분석
+# ============================
+print("\n=== 오분류 케이스 분석 ===")
+
+# False Positive (없는데 있다고 판단)
+phone_fp = df_eval[df_eval["phone_case"] == "FP"]
+sleepy_fp = df_eval[df_eval["sleepy_case"] == "FP"]
+seat_fp = df_eval[df_eval["seat_case"] == "FP"]
+
+print(f"\n폰 사용 FP (실제 안쓰는데 쓴다고 판단): {len(phone_fp)}건")
+if len(phone_fp) > 0:
+  print(phone_fp[["segment_idx", "phone_use", "hand_face", "pred_phone", "phone_gt"]].head())
+
+print(f"\n졸음 FP (실제 안졸린데 졸린다고 판단): {len(sleepy_fp)}건")
+if len(sleepy_fp) > 0:
+  print(sleepy_fp[["segment_idx", "perclos", "sleepy_flag", "EAR_baseline", "pred_sleepy", "sleepy_gt"]].head())
+
+print(f"\n자리 이탈 FP (실제 안이탈했는데 이탈했다고 판단): {len(seat_fp)}건")
+if len(seat_fp) > 0:
+  print(seat_fp[["segment_idx", "seat_departed", "pred_seat", "seat_gt"]].head())
+
+# False Negative (있는데 없다고 판단)
+phone_fn = df_eval[df_eval["phone_case"] == "FN"]
+sleepy_fn = df_eval[df_eval["sleepy_case"] == "FN"]
+seat_fn = df_eval[df_eval["seat_case"] == "FN"]
+
+print(f"\n폰 사용 FN (실제 쓰는데 안쓴다고 판단): {len(phone_fn)}건")
+if len(phone_fn) > 0:
+  print(phone_fn[["segment_idx", "phone_use", "hand_face", "pred_phone", "phone_gt"]].head())
+
+print(f"\n졸음 FN (실제 졸린데 안졸린다고 판단): {len(sleepy_fn)}건")
+if len(sleepy_fn) > 0:
+  print(sleepy_fn[["segment_idx", "perclos", "sleepy_flag", "EAR_baseline", "pred_sleepy", "sleepy_gt"]].head())
+
+print(f"\n자리 이탈 FN (실제 이탈했는데 안했다고 판단): {len(seat_fn)}건")
+if len(seat_fn) > 0:
+  print(seat_fn[["segment_idx", "seat_departed", "pred_seat", "seat_gt"]].head())
+
+
+# ============================
+# 8) CSV 저장
+# ============================
+# 주요 컬럼만 선택해서 저장
+output_cols = [
+  "segment_idx",
+  # 모델 원본 점수
+  "phone_use", "hand_face", "perclos", "sleepy_flag", "seat_departed",
+  "final", "personalized",
+  # 모델 예측
+  "pred_phone", "pred_sleepy", "pred_seat",
+  # 사람 라벨
+  "phone_gt", "sleepy_gt", "seat_gt",
+  # 정답 여부
+  "phone_correct", "sleepy_correct", "seat_correct",
+  # 케이스 분류
+  "phone_case", "sleepy_case", "seat_case"
+]
+
+df_output = df_eval[output_cols]
+df_output.to_csv("/content/drive/MyDrive/ai_study_flow_tracker/model_vs_human_compare.csv",
+                 index=False, encoding="utf-8-sig")
+
+print("\n✅ model_vs_human_compare.csv 저장 완료!")
+print(f"저장된 컬럼: {', '.join(output_cols)}")
+print(f"\n첫 5개 세그먼트 미리보기:")
+print(df_output.head().to_string(index=False))
+
+# %%
+# ============================
+# 🔥 최종 정확도(%) 요약 출력
+# ============================
+
+phone_pct  = phone_acc * 100
+sleepy_pct = sleepy_acc * 100
+seat_pct   = seat_acc * 100
+
+overall_acc = (phone_acc + sleepy_acc + seat_acc) / 3
+overall_pct = overall_acc * 100
+
+print("\n===================================")
+print("📊 최종 Accuracy 요약")
+print("===================================")
+print(f"📱 폰 사용 정확도: {phone_pct:.2f}%")
+print(f"😪 졸음 정확도:     {sleepy_pct:.2f}%")
+print(f"💺 자리 이탈 정확도: {seat_pct:.2f}%")
+print("-----------------------------------")
+print(f"🔥 전체 평균 정확도: {overall_pct:.2f}%")
+print("===================================\n")
