@@ -1,7 +1,15 @@
+# LLM
 transformers
 accelerate
 sentencepiece
 bitsandbytes
 torch
+
+# 전처리
+mediapipe>=0.10.30
+opencv-python-headless
+numpy
 pandas
+
+# 시각화
 matplotlib
