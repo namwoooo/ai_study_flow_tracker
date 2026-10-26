@@ -1,23 +1,15 @@
-# # feature 추가
-
-# %%
-from google.colab import drive
-drive.mount('/content/drive')
-
-# %%
-!pip install mediapipe
-
-# =========================
 # 1) 라이브러리 임포트
-# =========================
+
 import os
 import cv2
 import numpy as np #파일 경로, 영상처리, 수치연산 사용 import
-from moviepy.editor import VideoFileClip #동영상에서 특정 시각 프레임을 뽑아오기 위해 moviePy 사용
 import mediapipe as mp # 얼굴 눈 몸 랜드마크 검출
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 import pandas as pd
+import time
 
-# %%
+
 # --- EAR에 쓸 MediaPipe FaceMesh 눈 랜드마크 인덱스(6 points) ---
 # (자주 쓰이는 조합. 왼/오른쪽 각각 p1..p6 순서)
 LEFT_EYE_IDXS  = [33, 160, 158, 133, 153, 144]   # p1,p2,p3,p4,p5,p6
@@ -72,14 +64,11 @@ def paper_gaze_score_from_ears(ear_L_series, ear_R_series, ear_thresh=0.21,
   conc_norm = (conc_raw - mn) / (mx - mn + 1e-8)
   return float(np.clip(conc_norm, 0.0, 1.0))
 
-# =========================
-# 2) 영상 경로 & 파라미터
-# =========================
-from google.colab import drive
-drive.mount('/content/drive')
 
-video_path = "/content/drive/MyDrive/videos/video_data1_kimnamwoo.mp4"
-target_fps   = 10            # 샘플링 fps (초당 10 프레임으로 균일 샘플링)
+# 2) 영상 경로 & 파라미터
+
+video_path = "/content/drive/MyDrive/ai_study_flow_tracker/video_namwoo.mp4"
+target_fps   = 5            # 샘플링 fps (초당 5 프레임으로 균일 샘플링)
 segment_sec  = 5             # 세그먼트 길이(초), 세그먼트 길이를 5초 = 50프레임으로 설정
 segment_size = target_fps * segment_sec
 model_input_size = (224, 224)  # ViT 입력 크기, 얼굴 crop을 모델 입력 크기로 리사이즈
@@ -87,258 +76,140 @@ model_input_size = (224, 224)  # ViT 입력 크기, 얼굴 crop을 모델 입력
 if not os.path.exists(video_path):
   raise FileNotFoundError(f"{video_path} 존재하지 않음")
 
-# =========================
+
 # 3) MediaPipe 초기화 (video용)
-# =========================
-mp_face = mp.solutions.face_mesh.FaceMesh(
-  static_image_mode=False,          # 영상 처리 → False 권장, 비디오 모드로 FaceMesh 초기화(연속 프레임 추적 안정, 홍채/정교화 사용).
-  max_num_faces=1,
-  refine_landmarks=True             # iris/정교화
-)
-mp_pose = mp.solutions.pose.Pose(     #pose도 비디오 모드로 초기화
-  static_image_mode=False
+
+BaseOptions = mp.tasks.BaseOptions
+FaceLandmarker = mp.tasks.vision.FaceLandmarker
+PoseLandmarker = mp.tasks.vision.PoseLandmarker
+FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+face_base_options = BaseOptions(model_asset_path="face_landmarker.task")
+pose_base_options = BaseOptions(model_asset_path="pose_landmarker.task")
+
+mp_face = FaceLandmarker.create_from_options(FaceLandmarkerOptions(base_options=face_base_options, running_mode=VisionRunningMode.VIDEO, num_faces=1)
+                                             )
+mp_pose = PoseLandmarker.create_from_options(     #pose도 비디오 모드로 초기화
+  PoseLandmarkerOptions(base_options=pose_base_options, running_mode=VisionRunningMode.VIDEO, num_poses=1)
 )
 
-# =========================
+
 # 4) 영상 읽고 프레임 샘플링 + 얼굴 crop + 정규화 + 눈/EAR + Pose
-# =========================
-clip = VideoFileClip(video_path)
-duration = clip.duration
-num_frames = int(duration * target_fps)
+
+cap = cv2.VideoCapture(video_path)
+native_fps = cap.get(cv2.CAP_PROP_FPS)
+frame_interval = max(1, round(native_fps / target_fps))  # 몇 프레임마다 하나씩 뽑을지
 
 processed_frames = []     # 모델 입력용 face crop (정규화)
 face_bboxes = []          # (x1,y1,x2,y2) or None, 얼굴 바운딩 박스
 eyes_landmarks = []       # (eyeL(6,2), eyeR(6,2)) or None
 pose_keypoints = []       # (33*3,) float list
+frame_sizes = []
+frame_idx = 0
+t_idx = 0
 
-for t_idx in range(num_frames):
-  t_sec = t_idx / target_fps
-  frame_rgb = clip.get_frame(t_sec)                 # RGB
-  frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-  h, w, _ = frame_bgr.shape
+# 전처리 시간 측정
+t0 = time.time()
+t_face_total = 0.0
+t_pose_total = 0.0
+t_skip_total = 0.0
 
-  # --- FaceMesh
-  res_face = mp_face.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+# grab()과 retrieve()로 분리하여 실제 디코딩할 프레임만 디코딩
+while True:
+  if frame_idx % frame_interval == 0:
+    ret = cap.grab()
+    if not ret:
+      break
+    ret, frame_bgr = cap.retrieve()  # 실제 디코딩할 프레임
+    if not ret:
+      break
+    frame_idx += 1
 
-  bbox = None
-  eye_pair = None
-  if res_face.multi_face_landmarks:
-    lm = res_face.multi_face_landmarks[0].landmark
+    t_sec = (frame_idx - 1) / native_fps
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    h, w, _ = frame_bgr.shape
+
+    # numpy array -> mp.Image 타입 전환
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+    timestamp_ms = int(t_sec * 1000)
+
+    _tf = time.time()
+    res_face = mp_face.detect_for_video(mp_image, timestamp_ms)
+    t_face_total += time.time() - _tf
+
+    if not res_face.face_landmarks:
+      processed_frames.append(None)
+      face_bboxes.append(None)
+      frame_sizes.append(None)
+      eyes_landmarks.append(None)
+      pose_keypoints.append(None)
+      continue
+
+    lm = res_face.face_landmarks[0]
     x_coords = np.array([p.x for p in lm]); y_coords = np.array([p.y for p in lm])
     xmin, xmax = int(x_coords.min()*w), int(x_coords.max()*w)
     ymin, ymax = int(y_coords.min()*h), int(y_coords.max()*h)
-    # bbox clip
     xmin, ymin = max(0, xmin), max(0, ymin)
     xmax, ymax = min(w-1, xmax), min(h-1, ymax)
-    if xmax > xmin and ymax > ymin:
-      bbox = (xmin, ymin, xmax, ymax)
-      face_crop = frame_bgr[ymin:ymax, xmin:xmax]
-      if face_crop.size > 0:
-        face_crop_resized = cv2.resize(face_crop, model_input_size)
-        face_crop_norm = (face_crop_resized.astype(np.float32)/127.5) - 1.0
-        processed_frames.append(face_crop_norm)
-      else:
-        # 얼굴 실패 시 프레임 스킵
-        continue
-    else:
+    if xmax <= xmin or ymax <= ymin:
+      processed_frames.append(None)
+      face_bboxes.append(None)
+      frame_sizes.append(None)
+      eyes_landmarks.append(None)
+      pose_keypoints.append(None)
       continue
 
-    # EAR용 눈 6점씩 픽셀좌표 뽑기
+    bbox = (xmin, ymin, xmax, ymax)
+
+    face_crop = frame_bgr[ymin:ymax, xmin:xmax]
+    if face_crop.size == 0:
+      processed_frames.append(None)
+      face_bboxes.append(None)
+      frame_sizes.append(None)
+      eyes_landmarks.append(None)
+      pose_keypoints.append(None)
+      continue
+    face_bboxes.append(bbox)
+    frame_sizes.append((w, h))   # 이 프레임의 원본 크기 기록
+    processed_frames.append(True)
+
     lm_np = np.array([[p.x*w, p.y*h] for p in lm], dtype=np.float32)
     try:
       eyeL = lm_np[LEFT_EYE_IDXS, :]
       eyeR = lm_np[RIGHT_EYE_IDXS, :]
-      eye_pair = (eyeL, eyeR)
+      eyes_landmarks.append((eyeL, eyeR))
     except Exception:
-      eye_pair = None
+      eyes_landmarks.append(None)
+
+    # res_pose = mp_pose.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    _tp = time.time()
+    res_pose = mp_pose.detect_for_video(mp_image, timestamp_ms)
+    t_pose_total += time.time() - _tp
+
+    if res_pose.pose_landmarks:
+      vec = []
+      for lm_p in res_pose.pose_landmarks[0]:
+        vec.extend([lm_p.x, lm_p.y, lm_p.z])  # MediaPipe Pose는 정규화 좌표
+      pose_keypoints.append(vec)
+    else:
+      pose_keypoints.append([0.0]*(33*3))
+    t_idx += 1
   else:
-    # 얼굴 없으면 이 프레임 전체를 건너뜀(세그먼트 정합을 위해 skip)
-    continue
+    _ts = time.time()
+    ret = cap.grab()  # 디코딩 없이 건너 뛰기
+    t_skip_total += time.time() - _ts
+    if not ret:
+      break
+    frame_idx += 1
+cap.release()
+num_frames = len(processed_frames)  # 루프 후 실제 처리된 샘플 수
 
-  # --- Pose
-  res_pose = mp_pose.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-  if res_pose.pose_landmarks:
-    vec = []
-    for lm_p in res_pose.pose_landmarks.landmark:
-      vec.extend([lm_p.x, lm_p.y, lm_p.z])
-    pose_keypoints.append(vec)
-  else:
-    pose_keypoints.append([0.0]*(33*3))
-
-  # 저장(얼굴이 있었던 프레임만 append했으므로 길이 정합 ok)
-  face_bboxes.append(bbox)
-  eyes_landmarks.append(eye_pair)
-
-processed_frames = np.array(processed_frames)
-pose_keypoints = np.array(pose_keypoints, dtype=np.float32)
-
-print("샘플링 + 전처리 완료:", processed_frames.shape)
-print("Pose keypoints shape:", pose_keypoints.shape)
-
-# =========================
-# 5) 세그먼트 점수 계산 (논문식 시선 + 기존 안정성 + 자세)
-# =========================
-def compute_segment_scores(processed_frames, pose_keypoints, eyes_landmarks,
-                           segment_size,
-                           params=None):
-  T = len(processed_frames)
-  num_segments = T // segment_size
-  results = []
-
-  P = {
-    'ear_thresh': 0.21,
-    'gaze_change_norm': (0.0, 0.50),   # 작을수록 좋음
-    'pose_l2_norm':     (0.0, 0.30),   # 작을수록 좋음
-    'time_decay_lambda': 0.08,         # 세그먼트 내부 프레임 가중
-    'gaze_mix': {'paper': 0.7, 'stability': 0.3},  # 논문식 vs 기존 프록시 가중
-    'ec_clip': (1e-3, 0.9),
-    'conc_minmax': (1.0, 10.0)
-  }
-  if params: P.update(params)
-
-  for seg_idx in range(num_segments):
-    s = seg_idx * segment_size
-    e = s + segment_size
-    w = time_decay_weights(segment_size, lam=P['time_decay_lambda'])
-
-    # --- 5.1 기존 gaze stability (RGB mean 프록시)
-    gx = processed_frames[s:e].reshape(segment_size, -1).mean(axis=1)
-    gdiff = np.abs(np.diff(gx))
-    gaze_change = float(np.average(gdiff, weights=w[1:]))
-    gaze_stability_score = to_score(gaze_change, *P['gaze_change_norm'], small_is_good=True)
-
-    # --- 5.2 논문식 gaze (EAR → e_l, e_r → e_c → 1/e_c)
-    ear_L = []
-    ear_R = []
-    for t in range(s, e):
-      eyes = eyes_landmarks[t]
-      if eyes is None:
-        ear_L.append(np.nan); ear_R.append(np.nan)
-        continue
-      eyeL, eyeR = eyes
-      try:
-        ear_L.append(eye_aspect_ratio_6pts(eyeL))
-        ear_R.append(eye_aspect_ratio_6pts(eyeR))
-      except Exception:
-        ear_L.append(np.nan); ear_R.append(np.nan)
-    ear_L = np.array(ear_L, dtype=np.float32)
-    ear_R = np.array(ear_R, dtype=np.float32)
-    gaze_paper_score = paper_gaze_score_from_ears(
-      ear_L, ear_R,
-      ear_thresh=P['ear_thresh'],
-      ec_clip=P['ec_clip'],
-      conc_minmax=P['conc_minmax']
-    )
-    gaze_score = P['gaze_mix']['paper']*gaze_paper_score + P['gaze_mix']['stability']*gaze_stability_score
-
-    # --- 5.3 Pose stability (프레임간 키포인트 L2, 작을수록 좋음)
-    pose_changes = []
-    for t in range(s+1, e):
-      v_t   = pose_keypoints[t]
-      v_tm1 = pose_keypoints[t-1]
-      pose_changes.append(l2_norm(v_t, v_tm1))
-    pose_changes = np.array(pose_changes, dtype=np.float32)
-    pose_stab = float(np.average(pose_changes, weights=w[1:])) if pose_changes.size else 0.0
-    pose_score = to_score(pose_stab, *P['pose_l2_norm'], small_is_good=True)
-
-    # --- 5.4 최종(간단 가중 평균). 필요시 더 많은 룰 항목 추가 가능
-    final_score = 0.5*gaze_score + 0.5*pose_score
-
-    results.append({
-      'segment_idx': seg_idx,
-      'scores': {
-        'gaze_paper': gaze_paper_score,
-        'gaze_stability': gaze_stability_score,
-        'gaze_combined': gaze_score,
-        'pose_stability': pose_score,
-        'final': final_score
-      },
-      'raw': {
-        'gaze_change': gaze_change,
-        'pose_l2_mean': pose_stab
-      }
-    })
-
-  return results
-
-seg_results = compute_segment_scores(
-  processed_frames=processed_frames,
-  pose_keypoints=pose_keypoints,
-  eyes_landmarks=eyes_landmarks,
-  segment_size=segment_size,
-  params={
-    'time_decay_lambda': 0.08,
-    'gaze_mix': {'paper': 0.7, 'stability': 0.3},
-    'conc_minmax': (1.0, 10.0),  # 데이터 보고 튜닝 권장
-  }
-)
-
-print("5초 단위 final scores 예시:",
-      [round(r['scores']['final'], 3) for r in seg_results[:10]])
-
-# %%
-# ... (위 초기화 동일)
-
-processed_frames = []
-face_bboxes = []
-eyes_landmarks = []
-pose_keypoints = []
-frame_sizes = []   # ← 추가: (w,h) 저장
-
-for t_idx in range(num_frames):
-  t_sec = t_idx / target_fps
-  frame_rgb = clip.get_frame(t_sec)
-  frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-  h, w, _ = frame_bgr.shape
-
-  res_face = mp_face.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-  if not res_face.multi_face_landmarks:
-    continue
-
-  lm = res_face.multi_face_landmarks[0].landmark
-  x_coords = np.array([p.x for p in lm]); y_coords = np.array([p.y for p in lm])
-  xmin, xmax = int(x_coords.min()*w), int(x_coords.max()*w)
-  ymin, ymax = int(y_coords.min()*h), int(y_coords.max()*h)
-  xmin, ymin = max(0, xmin), max(0, ymin)
-  xmax, ymax = min(w-1, xmax), min(h-1, ymax)
-  if xmax <= xmin or ymax <= ymin:
-    continue
-
-  bbox = (xmin, ymin, xmax, ymax)
-  face_bboxes.append(bbox)
-  frame_sizes.append((w, h))   # ← 추가: 이 프레임의 원본 크기 기록
-
-  face_crop = frame_bgr[ymin:ymax, xmin:xmax]
-  if face_crop.size == 0:
-    continue
-  face_crop_resized = cv2.resize(face_crop, model_input_size)
-  face_crop_norm = (face_crop_resized.astype(np.float32)/127.5) - 1.0
-  processed_frames.append(face_crop_norm)
-
-  lm_np = np.array([[p.x*w, p.y*h] for p in lm], dtype=np.float32)
-  try:
-    eyeL = lm_np[LEFT_EYE_IDXS, :]
-    eyeR = lm_np[RIGHT_EYE_IDXS, :]
-    eyes_landmarks.append((eyeL, eyeR))
-  except Exception:
-    eyes_landmarks.append(None)
-
-  res_pose = mp_pose.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-  if res_pose.pose_landmarks:
-    vec = []
-    for lm_p in res_pose.pose_landmarks.landmark:
-      vec.extend([lm_p.x, lm_p.y, lm_p.z])  # MediaPipe Pose는 정규화 좌표
-    pose_keypoints.append(vec)
-  else:
-    pose_keypoints.append([0.0]*(33*3))
-
-processed_frames = np.array(processed_frames)
-pose_keypoints = np.array(pose_keypoints, dtype=np.float32)
-
-# %%
-# ----------------------------------------
+print(f"[전처리] 프레임 추출+mediapipe: {time.time() - t0:.1f}초 (총 {num_frames}프레임)")
+#%%
 # BlazePose index mapping
-# ----------------------------------------
+
 POSE_IDX = {
   'nose': 0,
   'eye_l': 2, 'eye_r': 5,
@@ -371,9 +242,9 @@ def perclos(ear_series, ear_thresh=0.21):
   return float((ear_series[valid] < ear_thresh).mean())
 
 
-# ----------------------------------------
+
 # 업그레이드 졸음 기능 (Baseline EAR + 70% closure + 5초 지속 + head nod)
-# ----------------------------------------
+
 def compute_EAR_baseline(ear_series, min_samples=30):
   ear_series = np.array(ear_series)
   ear_series = ear_series[np.isfinite(ear_series)]
@@ -381,13 +252,13 @@ def compute_EAR_baseline(ear_series, min_samples=30):
     return np.median(ear_series) if len(ear_series)>0 else 0.25
   return np.median(ear_series[:min_samples])
 
-def is_eye_closure(ear, ear_baseline, ratio=0.30):
+def is_eye_closure(ear, ear_baseline, ratio=0.55):
   return ear < (ear_baseline * ratio)
 
 
-# ----------------------------------------
+
 # segment scoring
-# ----------------------------------------
+
 def compute_segment_scores_7features(
         processed_frames,
         pose_keypoints,
@@ -455,6 +326,7 @@ def compute_segment_scores_7features(
   for seg_idx in range(num_segments):
     s = seg_idx * segment_size
     e = s + segment_size
+    EAR_baseline = EAR_baseline_global
     wdec = time_decay_weights(segment_size, lam=P['time_decay_lambda'])
 
     # 누적
@@ -471,6 +343,9 @@ def compute_segment_scores_7features(
     sleepy_flags=[]
 
     for t in range(s, e):
+      # None일 경우 skip
+      if frame_sizes[t] is None:
+        continue
       w,h = frame_sizes[t]
       fb = face_bboxes[t]
       fc = center_of_bbox(fb) if fb is not None else None
@@ -534,7 +409,7 @@ def compute_segment_scores_7features(
           seat_flags.append(dist>ref_radius)
 
       # -----------------------------------------
-      # 4) ✨ 업그레이드된 EAR 기반 졸음 탐지
+      # 4) 업그레이드된 EAR 기반 졸음 탐지
       # -----------------------------------------
       if eyes_landmarks[t] is not None:
         try:
@@ -555,11 +430,17 @@ def compute_segment_scores_7features(
           else:
             EAR_baseline = EAR_baseline_global
 
-          # 70% closure
-          closed_70 = is_eye_closure(ear, EAR_baseline, ratio=0.30)
+          # 45% closure
+          closed_45 = is_eye_closure(ear, EAR_baseline, ratio=0.55)
+          if seg_idx < 3:  # 처음 몇 세그먼트만 확인
+            print(f"[seg {seg_idx}, t={t}] ear={ear:.4f}, baseline={EAR_baseline:.4f}, threshold={EAR_baseline*0.55:.4f}, closed={closed_45}")
+
+          if prev_closed is not None and prev_closed and not closed_45:
+            blink_transitions += 1
+          prev_closed = closed_45
 
           # closure duration
-          if closed_70: closure_frames += 1
+          if closed_45: closure_frames += 1
           else: closure_frames = 0
 
           closure_long = (closure_frames >= int(5 * fps))
@@ -578,7 +459,7 @@ def compute_segment_scores_7features(
     # -------------------------------
     # 점수 계산
     # -------------------------------
-    usage_ratio = sum(phone_use_flags)/len(phone_use_flags)
+    usage_ratio = sum(phone_use_flags)/len(phone_use_flags) if phone_use_flags else 0.0
     phone_use_score = 1.0 - usage_ratio
 
     seat_departed = any(seat_flags)
@@ -599,7 +480,7 @@ def compute_segment_scores_7features(
     blink_rate_proxy = blink_transitions/max(1,(e-s))
     blink_score=to_score(blink_rate_proxy,*P['norm']['blink_rate_proxy'],small_is_good=True)
 
-    # ✨ 업그레이드된 졸음 score
+    # 업그레이드된 졸음 score
     segment_sleepy = any(sleepy_flags)
     perclos_score = 1.0 - (1.0 if segment_sleepy else 0.0)
 
@@ -638,102 +519,9 @@ def compute_segment_scores_7features(
 
   return results
 
-# %%
-!pip install ipywidgets
-from IPython.display import display, HTML, clear_output
-import ipywidgets as widgets
-import pandas as pd
-import base64
-import subprocess
 
-def display_video_player(video_path, start_sec, end_sec):
-  seg_path = f"seg_{start_sec}_{end_sec}.mp4"
-  duration = end_sec - start_sec
+# 개인화/적용
 
-  cmd = f"ffmpeg -y -ss {start_sec} -i '{video_path}' -t {duration} -c copy {seg_path}"
-  subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-  video = open(seg_path, "rb").read()
-  b64 = base64.b64encode(video).decode()
-
-  html = f"""
-    <video width="480" controls autoplay>
-        <source src="data:video/mp4;base64,{b64}" type="video/mp4">
-    </video>
-    """
-  return HTML(html)
-video_path = "/content/drive/MyDrive/videos/video_data1_kimnamwoo.mp4"    # 너의 영상 경로
-segment_length = 10
-video_duration = 120                 # 너의 영상 길이로 수정
-num_segments = video_duration // segment_length
-
-human_labels = []
-current_seg = 0
-
-phone_label = widgets.ToggleButtons(
-  options=[("Yes",1), ("No",0)], description="📱 핸드폰?"
-)
-sleepy_label = widgets.ToggleButtons(
-  options=[("Yes",1), ("No",0)], description="😪 졸음?"
-)
-seat_label = widgets.ToggleButtons(
-  options=[("Yes",1), ("No",0)], description="🚶 자리이탈?"
-)
-
-save_button = widgets.Button(
-  description="저장하고 다음 ▶",
-  button_style="success"
-)
-
-ui_output = widgets.Output()
-def show_segment(seg_idx):
-  start = seg_idx * segment_length
-  end = (seg_idx + 1) * segment_length
-
-  clear_output()
-
-  print(f"=== Segment {seg_idx} ({start}초 ~ {end}초) ===\n")
-  display(display_video_player(video_path, start, end))
-  display(phone_label, sleepy_label, seat_label, save_button, ui_output)
-
-
-def on_save_clicked(b):
-  global current_seg
-
-  with ui_output:
-    clear_output()
-    print(f"Segment {current_seg} 저장됨.")
-
-  # 데이터 저장
-  human_labels.append({
-    "segment_idx": current_seg,
-    "phone_gt": phone_label.value,
-    "sleepy_gt": sleepy_label.value,
-    "seat_gt": seat_label.value,
-  })
-
-  current_seg += 1
-
-  if current_seg >= num_segments:
-    df = pd.DataFrame(human_labels)
-    df.to_csv("human_labels.csv", index=False)
-
-    clear_output()
-    print("🎉 모든 레이블 저장 완료!")
-    display(df)
-    return
-
-  # 다음 세그먼트로 이동
-  show_segment(current_seg)
-
-
-save_button.on_click(on_save_clicked)
-show_segment(0)
-
-# %% [markdown]
-# # 개인화/적용
-
-# %%
 # ========================================
 # 1) 초기 안정 구간 기반 개인화 Baseline 계산
 # ========================================
@@ -899,6 +687,7 @@ def apply_personalization_with_delta(segment_results, baseline):
 # ========================================
 
 # Step 1: 7-feature segment 점수 계산
+t1 = time.time()
 seg_results = compute_segment_scores_7features(
   processed_frames=processed_frames,
   pose_keypoints=pose_keypoints,
@@ -911,6 +700,7 @@ seg_results = compute_segment_scores_7features(
     'time_decay_lambda': 0.08,
   }
 )
+print(f"[점수 계산] {time.time() - t1:.1f}초")
 
 print(f"총 {len(seg_results)}개 세그먼트 계산 완료")
 
@@ -981,211 +771,4 @@ print(df[['final', 'personalized', 'personal_stability']].describe().round(3))
 output_path = "/content/drive/MyDrive/ai_study_flow_tracker/labels_personalized_video_30.csv"
 df.to_csv(output_path, index=False, encoding="utf-8-sig")
 print(f"\n결과 저장 완료: {output_path}")
-
-# %% [markdown]
-# # 자동/수동 라벨링 비교
-
-# %%
-import pandas as pd
-import numpy as np
-
-# ============================
-# 1) CSV 로드
-# ============================
-df_model = pd.read_csv("/content/drive/MyDrive/ai_study_flow_tracker/labels_personalized_video_30.csv")
-df_human = pd.read_csv("/content/human_labels.csv")
-
-print(f"모델 라벨: {len(df_model)}개 세그먼트")
-print(f"사람 라벨: {len(df_human)}개 세그먼트")
-
-# ============================
-# 2) 모델 예측 기준 정의
-# ============================
-
-# 🔥 핸드폰 사용 판단: phone_use 점수가 낮으면 폰 사용 중
-# phone_use 점수: 높을수록 폰 안쓰는 것 (1.0 = 폰 안씀, 0.0 = 폰 사용)
-# threshold: 0.7 미만이면 폰 사용으로 판단
-df_model["pred_phone"] = (df_model["phone_use"] < 0.7).astype(int)
-
-# 🔥 졸음 판단: sleepy_flag 직접 사용 (이미 0 또는 1)
-# sleepy_flag == 1: 졸음 감지됨 (70% eye closure 5초 지속 또는 head nod)
-df_model["pred_sleepy"] = df_model["sleepy_flag"].astype(int)
-
-# 🔥 자리 이탈 판단: seat_departed 직접 사용 (이미 True/False)
-df_model["pred_seat"] = df_model["seat_departed"].astype(int)
-
-print("\n=== 모델 예측 분포 ===")
-print(f"폰 사용 예측: {df_model['pred_phone'].sum()} / {len(df_model)} 세그먼트")
-print(f"졸음 예측: {df_model['pred_sleepy'].sum()} / {len(df_model)} 세그먼트")
-print(f"자리 이탈 예측: {df_model['pred_seat'].sum()} / {len(df_model)} 세그먼트")
-
-
-# ============================
-# 3) segment_idx로 병합
-# ============================
-df_eval = df_model.merge(df_human, on="segment_idx", how="inner")
-print(f"\n병합 결과: {len(df_eval)}개 세그먼트")
-
-if len(df_eval) == 0:
-  print("⚠️ 경고: 병합된 데이터가 없습니다. segment_idx가 일치하는지 확인하세요.")
-  print("모델 segment_idx 범위:", df_model["segment_idx"].min(), "~", df_model["segment_idx"].max())
-  print("사람 segment_idx 범위:", df_human["segment_idx"].min(), "~", df_human["segment_idx"].max())
-
-
-# ============================
-# 4) 정답 여부 계산
-# ============================
-df_eval["phone_correct"]  = (df_eval["pred_phone"]  == df_eval["phone_gt"]).astype(int)
-df_eval["sleepy_correct"] = (df_eval["pred_sleepy"] == df_eval["sleepy_gt"]).astype(int)
-df_eval["seat_correct"]   = (df_eval["pred_seat"]   == df_eval["seat_gt"]).astype(int)
-
-# 전체 정확도
-phone_acc  = df_eval["phone_correct"].mean()
-sleepy_acc = df_eval["sleepy_correct"].mean()
-seat_acc   = df_eval["seat_correct"].mean()
-
-print("\n=== 정확도 (Accuracy) ===")
-print(f"폰 사용: {phone_acc:.3f} ({df_eval['phone_correct'].sum()}/{len(df_eval)})")
-print(f"졸음:   {sleepy_acc:.3f} ({df_eval['sleepy_correct'].sum()}/{len(df_eval)})")
-print(f"자리 이탈: {seat_acc:.3f} ({df_eval['seat_correct'].sum()}/{len(df_eval)})")
-
-
-# ============================
-# 5) TP/FP/FN/TN 케이스 분류
-# ============================
-def case(gt, pred):
-  """
-  TP: True Positive  - 실제 1, 예측 1 (맞춤)
-  FP: False Positive - 실제 0, 예측 1 (틀림 - 없는데 있다고 함)
-  FN: False Negative - 실제 1, 예측 0 (틀림 - 있는데 없다고 함)
-  TN: True Negative  - 실제 0, 예측 0 (맞춤)
-  """
-  if gt == 1 and pred == 1: return "TP"
-  if gt == 0 and pred == 1: return "FP"
-  if gt == 1 and pred == 0: return "FN"
-  return "TN"
-
-df_eval["phone_case"]  = df_eval.apply(lambda r: case(r["phone_gt"],  r["pred_phone"]),  axis=1)
-df_eval["sleepy_case"] = df_eval.apply(lambda r: case(r["sleepy_gt"], r["pred_sleepy"]), axis=1)
-df_eval["seat_case"]   = df_eval.apply(lambda r: case(r["seat_gt"],   r["pred_seat"]),   axis=1)
-
-
-# ============================
-# 6) Confusion Matrix 출력
-# ============================
-def print_confusion_matrix(df, gt_col, pred_col, case_col, label):
-  print(f"\n=== {label} Confusion Matrix ===")
-  print(f"{'':8s} | Pred=0 | Pred=1")
-  print("-" * 30)
-
-  tn = (df[case_col] == "TN").sum()
-  fp = (df[case_col] == "FP").sum()
-  fn = (df[case_col] == "FN").sum()
-  tp = (df[case_col] == "TP").sum()
-
-  print(f"GT=0    | {tn:6d} | {fp:6d}")
-  print(f"GT=1    | {fn:6d} | {tp:6d}")
-
-  # Precision, Recall, F1
-  precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-  recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-  f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-
-  print(f"\nPrecision: {precision:.3f}")
-  print(f"Recall:    {recall:.3f}")
-  print(f"F1-Score:  {f1:.3f}")
-
-print_confusion_matrix(df_eval, "phone_gt", "pred_phone", "phone_case", "폰 사용")
-print_confusion_matrix(df_eval, "sleepy_gt", "pred_sleepy", "sleepy_case", "졸음")
-print_confusion_matrix(df_eval, "seat_gt", "pred_seat", "seat_case", "자리 이탈")
-
-
-# ============================
-# 7) 오분류 케이스 분석
-# ============================
-print("\n=== 오분류 케이스 분석 ===")
-
-# False Positive (없는데 있다고 판단)
-phone_fp = df_eval[df_eval["phone_case"] == "FP"]
-sleepy_fp = df_eval[df_eval["sleepy_case"] == "FP"]
-seat_fp = df_eval[df_eval["seat_case"] == "FP"]
-
-print(f"\n폰 사용 FP (실제 안쓰는데 쓴다고 판단): {len(phone_fp)}건")
-if len(phone_fp) > 0:
-  print(phone_fp[["segment_idx", "phone_use", "hand_face", "pred_phone", "phone_gt"]].head())
-
-print(f"\n졸음 FP (실제 안졸린데 졸린다고 판단): {len(sleepy_fp)}건")
-if len(sleepy_fp) > 0:
-  print(sleepy_fp[["segment_idx", "perclos", "sleepy_flag", "EAR_baseline", "pred_sleepy", "sleepy_gt"]].head())
-
-print(f"\n자리 이탈 FP (실제 안이탈했는데 이탈했다고 판단): {len(seat_fp)}건")
-if len(seat_fp) > 0:
-  print(seat_fp[["segment_idx", "seat_departed", "pred_seat", "seat_gt"]].head())
-
-# False Negative (있는데 없다고 판단)
-phone_fn = df_eval[df_eval["phone_case"] == "FN"]
-sleepy_fn = df_eval[df_eval["sleepy_case"] == "FN"]
-seat_fn = df_eval[df_eval["seat_case"] == "FN"]
-
-print(f"\n폰 사용 FN (실제 쓰는데 안쓴다고 판단): {len(phone_fn)}건")
-if len(phone_fn) > 0:
-  print(phone_fn[["segment_idx", "phone_use", "hand_face", "pred_phone", "phone_gt"]].head())
-
-print(f"\n졸음 FN (실제 졸린데 안졸린다고 판단): {len(sleepy_fn)}건")
-if len(sleepy_fn) > 0:
-  print(sleepy_fn[["segment_idx", "perclos", "sleepy_flag", "EAR_baseline", "pred_sleepy", "sleepy_gt"]].head())
-
-print(f"\n자리 이탈 FN (실제 이탈했는데 안했다고 판단): {len(seat_fn)}건")
-if len(seat_fn) > 0:
-  print(seat_fn[["segment_idx", "seat_departed", "pred_seat", "seat_gt"]].head())
-
-
-# ============================
-# 8) CSV 저장
-# ============================
-# 주요 컬럼만 선택해서 저장
-output_cols = [
-  "segment_idx",
-  # 모델 원본 점수
-  "phone_use", "hand_face", "perclos", "sleepy_flag", "seat_departed",
-  "final", "personalized",
-  # 모델 예측
-  "pred_phone", "pred_sleepy", "pred_seat",
-  # 사람 라벨
-  "phone_gt", "sleepy_gt", "seat_gt",
-  # 정답 여부
-  "phone_correct", "sleepy_correct", "seat_correct",
-  # 케이스 분류
-  "phone_case", "sleepy_case", "seat_case"
-]
-
-df_output = df_eval[output_cols]
-df_output.to_csv("/content/drive/MyDrive/ai_study_flow_tracker/model_vs_human_compare.csv",
-                 index=False, encoding="utf-8-sig")
-
-print("\n✅ model_vs_human_compare.csv 저장 완료!")
-print(f"저장된 컬럼: {', '.join(output_cols)}")
-print(f"\n첫 5개 세그먼트 미리보기:")
-print(df_output.head().to_string(index=False))
-
-# %%
-# ============================
-# 🔥 최종 정확도(%) 요약 출력
-# ============================
-
-phone_pct  = phone_acc * 100
-sleepy_pct = sleepy_acc * 100
-seat_pct   = seat_acc * 100
-
-overall_acc = (phone_acc + sleepy_acc + seat_acc) / 3
-overall_pct = overall_acc * 100
-
-print("\n===================================")
-print("📊 최종 Accuracy 요약")
-print("===================================")
-print(f"📱 폰 사용 정확도: {phone_pct:.2f}%")
-print(f"😪 졸음 정확도:     {sleepy_pct:.2f}%")
-print(f"💺 자리 이탈 정확도: {seat_pct:.2f}%")
-print("-----------------------------------")
-print(f"🔥 전체 평균 정확도: {overall_pct:.2f}%")
-print("===================================\n")
+print(f"총 전처리 파이프라인: {time.time() - t0:.1f}초")
