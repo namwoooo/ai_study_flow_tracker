@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from data_preprocessing.preprocessing.config import (
+from .config import (
     BASELINE_DEFAULT_MEANS,
     FINAL_MIX_WEIGHT,
     SEAT_DEPART_PENALTY,

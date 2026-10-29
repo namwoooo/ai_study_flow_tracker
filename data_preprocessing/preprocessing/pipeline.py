@@ -4,13 +4,13 @@ import time
 
 import pandas as pd
 
-from data_preprocessing.preprocessing.config import FACE_MODEL_PATH, POSE_MODEL_PATH, SEGMENT_SEC, TARGET_FPS, WARMUP_SEGMENTS
-from data_preprocessing.preprocessing.extraction import extract_landmarks
-from data_preprocessing.preprocessing.personalization import (
+from .config import FACE_MODEL_PATH, POSE_MODEL_PATH, SEGMENT_SEC, TARGET_FPS, WARMUP_SEGMENTS
+from .extraction import extract_landmarks
+from .personalization import (
     apply_personalization_with_delta,
     compute_personal_baseline_stability_filtered,
 )
-from data_preprocessing.preprocessing.scoring import compute_segment_scores_7features
+from .scoring import compute_segment_scores_7features
 
 CSV_COLUMNS = [
     "segment_idx",

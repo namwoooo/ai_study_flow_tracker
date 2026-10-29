@@ -7,8 +7,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from data_preprocessing.preprocessing.config import FACE_MODEL_PATH, POSE_MODEL_PATH, TARGET_FPS
-from data_preprocessing.preprocessing.features import LEFT_EYE_IDXS, RIGHT_EYE_IDXS
+from .config import FACE_MODEL_PATH, POSE_MODEL_PATH, TARGET_FPS
+from .features import LEFT_EYE_IDXS, RIGHT_EYE_IDXS
 
 BaseOptions = mp.tasks.BaseOptions
 FaceLandmarker = mp.tasks.vision.FaceLandmarker
@@ -92,11 +92,12 @@ def _process_sampled_frame(frame_bgr, timestamp_ms, mp_face, mp_pose, frames, ti
     if res_pose.pose_landmarks:
         vec = []
         for lm_p in res_pose.pose_landmarks[0]:
-            vec.extend([lm_p.x, lm_p.y, lm_p.z])  # 정규화 좌표
+            # 모든 랜드마크가 걸러지는 것 방지 위해 1.0 부여
+            vis = lm_p.visibility if lm_p.visibility is not None else 1.0
+            vec.extend([lm_p.x, lm_p.y, lm_p.z, vis])  # 33 x 4 (x, y, z, visibility)
         frames["pose_keypoints"].append(vec)
     else:
-        # TODO(Phase 5): None으로 변경. (0,0)이 유효 좌표로 통과해 shoulder/hand 점수가 왜곡됨
-        frames["pose_keypoints"].append([0.0] * (33 * 3))
+        frames["pose_keypoints"].append(None)
 
 
 def extract_landmarks(

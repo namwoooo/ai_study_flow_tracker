@@ -49,6 +49,8 @@ CLOSURE_LONG_SEC = 5            # 이 시간 이상 감김 지속 시 졸음
 SCORING_FPS = 30                # TODO(Phase 5): TARGET_FPS로 교체. 현재 값으로는 closure_long이 발생 불가
 HEAD_NOD_THRESH = 0.15          # head nod 판정 각도 변화(rad)
 
+# 해당 값 미만의 pose 랜드마크 무시
+POSE_VIS_THRESH = 0.5
 
 # 개인화
 WARMUP_SEGMENTS = 120           # 5초 × 120 = 10분

@@ -1,6 +1,6 @@
 import numpy as np
 
-from data_preprocessing.preprocessing.config import EAR_BASELINE_DEFAULT, EAR_BASELINE_MIN_SAMPLES, EYE_CLOSURE_RATIO
+from .config import EAR_BASELINE_DEFAULT, EAR_BASELINE_MIN_SAMPLES, EYE_CLOSURE_RATIO, POSE_VIS_THRESH
 
 # 랜드마크 인덱스
 # FaceLandmarker 눈 6점 (p1..p6 순서)
@@ -16,6 +16,8 @@ POSE_IDX = {
     "hip_l": 23, "hip_r": 24,
 }
 
+POSE_STRIDE = 4  # x, y, z, visibility
+
 
 # 기하 / 정규화
 def to_score(x, lo, hi, small_is_good=True):
@@ -26,12 +28,14 @@ def to_score(x, lo, hi, small_is_good=True):
     return (x - lo) / (hi - lo + 1e-8)
 
 
-def get_pose_xy(pose_vec, idx, w, h):
-    """정규화된 pose 벡터에서 idx번 랜드마크의 픽셀 좌표 반환. 범위 밖이면 None."""
-    base = idx * 3
-    if base + 1 >= len(pose_vec):
+def get_pose_xy(pose_vec, idx, w, h, vis_thresh=POSE_VIS_THRESH):
+    """idx번 랜드마크의 픽셀 좌표 / 범위 밖이거나 visibility가 낮으면(0.5 아래) None"""
+    base = idx * POSE_STRIDE
+    if base + 3 >= len(pose_vec):
         return None
-    x_n, y_n = pose_vec[base], pose_vec[base + 1]
+    x_n, y_n, vis = pose_vec[base], pose_vec[base + 1], pose_vec[base + 3]
+    if vis < vis_thresh:
+        return None
     if not (0 <= x_n <= 1 and 0 <= y_n <= 1):
         return None
     return (x_n * w, y_n * h)

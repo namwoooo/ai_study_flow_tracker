@@ -4,7 +4,7 @@ import copy
 
 import numpy as np
 
-from data_preprocessing.preprocessing.config import (
+from .config import (
     CLOSURE_LONG_SEC,
     DEFAULT_SCORING_PARAMS,
     EAR_BASELINE_DEFAULT,
@@ -17,7 +17,7 @@ from data_preprocessing.preprocessing.config import (
     REF_WINDOW_MIN,
     SCORING_FPS,
 )
-from data_preprocessing.preprocessing.features import (
+from .features import (
     POSE_IDX,
     angle_from_horizontal,
     center_of_bbox,
