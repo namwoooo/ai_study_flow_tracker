@@ -47,9 +47,10 @@ def center_of_bbox(b):
 
 
 def angle_from_horizontal(p_left, p_right):
-    # TODO(Phase 5): 좌우 순서에 따라 π 근처 값이 나올 수 있음 → min(a, π - a) 검토
+    """두 점을 잇는 선과 수평선 사이의 각도(0 ~ π/2) / 좌우 순서와 무관하게 설정"""
     v = np.array(p_right) - np.array(p_left)
-    return abs(np.arctan2(v[1], v[0]))
+    a = abs(np.arctan2(v[1], v[0]))
+    return min(a, np.pi - a)
 
 
 # 눈 / EAR
