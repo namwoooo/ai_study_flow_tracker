@@ -15,7 +15,7 @@ from .config import (
     REF_RADIUS_DEFAULT,
     REF_RADIUS_MIN,
     REF_WINDOW_MIN,
-    SCORING_FPS,
+    TARGET_FPS,
 )
 from .features import (
     POSE_IDX,
@@ -64,6 +64,7 @@ def compute_segment_scores_7features(
         ref_center=None,
         ref_radius=None,
         params=None,
+        fps=TARGET_FPS,
         debug=False,
 ):
     T = len(processed_frames)
@@ -80,6 +81,9 @@ def compute_segment_scores_7features(
     baseline_buffer = []
     ear_baseline_global = EAR_BASELINE_DEFAULT
 
+    closure_long_frames = max(1, int(round(CLOSURE_LONG_SEC * fps)))
+    closure_frames = 0  # 세그먼트 경계를 넘어 누적
+
     for seg_idx in range(num_segments):
         s = seg_idx * segment_size
         e = s + segment_size
@@ -93,8 +97,6 @@ def compute_segment_scores_7features(
         ear_series = []
         blink_transitions = 0
         prev_closed = None
-
-        closure_frames = 0
         sleepy_flags = []
 
         for t in range(s, e):
@@ -187,6 +189,7 @@ def compute_segment_scores_7features(
 
                     # EAR이 baseline의 55% 미만이면 감김
                     closed = is_eye_closure(ear, EAR_baseline, ratio=EYE_CLOSURE_RATIO)
+
                     if debug and seg_idx < 3:
                         print(
                             f"[seg {seg_idx}, t={t}] ear={ear:.4f}, baseline={EAR_baseline:.4f}, "
@@ -203,7 +206,7 @@ def compute_segment_scores_7features(
                     else:
                         closure_frames = 0
 
-                    closure_long = closure_frames >= int(CLOSURE_LONG_SEC * SCORING_FPS)
+                    closure_long = closure_frames >= closure_long_frames
 
                     head_nod = False
                     if len(head_angles) >= 3:

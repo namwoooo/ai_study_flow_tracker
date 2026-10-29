@@ -45,8 +45,7 @@ EAR_BASELINE_DEFAULT = 0.25     # baseline 계산 전 기본값
 EAR_BASELINE_WARMUP_FRAMES = 40 # baseline 수집 구간 (첫 세그먼트 내 프레임 인덱스 상한)
 EAR_BASELINE_MIN_SAMPLES = 30   # compute_EAR_baseline 최소 샘플 수
 EYE_CLOSURE_RATIO = 0.55        # EAR < baseline * ratio 이면 감김
-CLOSURE_LONG_SEC = 5            # 이 시간 이상 감김 지속 시 졸음
-SCORING_FPS = 30                # TODO(Phase 5): TARGET_FPS로 교체. 현재 값으로는 closure_long이 발생 불가
+CLOSURE_LONG_SEC = 2.0          # 이 시간 이상 감김 지속 시 졸음
 HEAD_NOD_THRESH = 0.15          # head nod 판정 각도 변화(rad)
 
 # 해당 값 미만의 pose 랜드마크 무시

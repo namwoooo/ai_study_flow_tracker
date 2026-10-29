@@ -80,6 +80,7 @@ def run(
         segment_size=segment_size,
         phone_bboxes=phone_bboxes,
         debug=debug,
+        fps=target_fps
     )
     t_scoring = time.time() - t1
 
