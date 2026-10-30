@@ -21,8 +21,9 @@ DEFAULT_SCORING_PARAMS = {
         "blink_rate_proxy": (0.02, 0.30),
         "perclos":          (0.00, 0.35),
     },
+    # 가중치는 합으로 정규화되므로 합이 1일 필요 없음
     "w": {
-        "phone_use":     0.16,
+        "phone_use":     0.0,    #TODO: 폰 검출 미구현
         "seat_depart":   0.12,
         "head_angle":    0.12,
         "shoulder_tilt": 0.12,
@@ -71,12 +72,13 @@ BASELINE_DEFAULT_MEANS = {
     "phone":    0.9,
 }
 
+# 가중치는 합으로 정규화되므로 합이 1일 필요 없음
 STABILITY_WEIGHTS = {
     "head":     0.25,
     "shoulder": 0.25,
     "hand":     0.20,
     "blink":    0.15,
-    "phone":    0.15,
+    "phone":    0.0,
 }
 
 SEAT_DEPART_PENALTY = 0.3       # 자리 이탈 시 stability에 곱함 (70% 감점)

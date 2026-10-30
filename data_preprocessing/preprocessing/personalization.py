@@ -13,6 +13,8 @@ from .config import (
     WARMUP_SEGMENTS,
 )
 
+from .features import weighted_mean
+
 
 def _safe_stats(arr, default_mean):
     if len(arr) == 0:
@@ -100,12 +102,10 @@ def apply_personalization_with_delta(segment_results, baseline):
         st_blink = _stability(raw["blink_rate_proxy"], b["blink_mean"], b["blink_std"])
         st_phone = _stability(sc["phone_use"], b["phone_mean"], b["phone_std"])
 
-        personal_stability = (
-                sw["head"] * st_head
-                + sw["shoulder"] * st_shoul
-                + sw["hand"] * st_hand
-                + sw["blink"] * st_blink
-                + sw["phone"] * st_phone
+        personal_stability = weighted_mean(
+            {"head": st_head, "shoulder": st_shoul, "hand": st_hand,
+             "blink": st_blink, "phone": st_phone},
+            STABILITY_WEIGHTS,
         )
 
         if flg["seat_departed"]:

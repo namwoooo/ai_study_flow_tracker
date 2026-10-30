@@ -24,6 +24,7 @@ from .features import (
     is_eye_closure,
     to_score,
     compute_ear_series,
+    weighted_mean,
 )
 
 
@@ -225,26 +226,21 @@ def compute_segment_scores_7features(
         segment_sleepy = any(sleepy_flags)
         perclos_score = 1.0 - (1.0 if segment_sleepy else 0.0)
 
-        final_score = (
-                W["phone_use"] * phone_use_score
-                + W["seat_depart"] * seat_depart_score
-                + W["head_angle"] * head_angle_score
-                + W["shoulder_tilt"] * shoulder_tilt_score
-                + W["hand_face"] * hand_face_score
-                + W["blink"] * blink_score
-                + W["perclos"] * perclos_score
-        )
+        feature_scores = {
+            "phone_use": phone_use_score,
+            "seat_depart": seat_depart_score,
+            "head_angle": head_angle_score,
+            "shoulder_tilt": shoulder_tilt_score,
+            "hand_face": hand_face_score,
+            "blink": blink_score,
+            "perclos": perclos_score,
+        }
+        final_score = weighted_mean(feature_scores, W)
 
         results.append({
             "segment_idx": seg_idx,
             "scores": {
-                "phone_use": round(phone_use_score, 4),
-                "seat_depart": round(seat_depart_score, 4),
-                "head_angle": round(head_angle_score, 4),
-                "shoulder_tilt": round(shoulder_tilt_score, 4),
-                "hand_face": round(hand_face_score, 4),
-                "blink": round(blink_score, 4),
-                "perclos": round(perclos_score, 4),
+                **{k: round(float(v), 4) for k, v in feature_scores.items()},
                 "final": round(final_score, 4),
             },
             "raw": {

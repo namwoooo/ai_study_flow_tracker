@@ -87,3 +87,11 @@ def compute_ear_series(eyes_landmarks):
         except Exception:
             pass
     return ears
+
+
+def weighted_mean(values, weights):
+    """weights 기준 가중 평균 적용"""
+    total = sum(weights.values())
+    if total <= 0:
+        raise ValueError("가중치 합이 0 이하")
+    return sum(weights[k] * values[k] for k in weights) / total
