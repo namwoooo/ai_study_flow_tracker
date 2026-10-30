@@ -81,6 +81,7 @@ def compute_segment_scores_7features(
 
     closure_long_frames = max(1, int(round(CLOSURE_LONG_SEC * fps)))
     closure_frames = 0  # 세그먼트 경계를 넘어 누적
+    prev_closed = None
 
     for seg_idx in range(num_segments):
         s = seg_idx * segment_size
@@ -93,7 +94,6 @@ def compute_segment_scores_7features(
         seat_flags = []
         ear_series = []
         blink_transitions = 0
-        prev_closed = None
         sleepy_flags = []
 
         for t in range(s, e):
