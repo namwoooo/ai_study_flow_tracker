@@ -1,3 +1,5 @@
+from importlib.metadata import pass_none
+
 import numpy as np
 
 from .config import EAR_BASELINE_DEFAULT, EAR_BASELINE_MIN_SAMPLES, EYE_CLOSURE_RATIO, POSE_VIS_THRESH
@@ -72,3 +74,16 @@ def compute_EAR_baseline(ear_series, min_samples=EAR_BASELINE_MIN_SAMPLES):
 
 def is_eye_closure(ear, ear_baseline, ratio=EYE_CLOSURE_RATIO):
     return ear < (ear_baseline * ratio)
+
+def compute_ear_series(eyes_landmarks):
+    """프레임별 양안 평균 EAR / 눈 랜드마크가 없거나 계산 실패 시 NaN"""
+    ears = np.full(len(eyes_landmarks), np.nan, dtype=np.float64)
+    for t, eyes in enumerate(eyes_landmarks):
+        if eyes is None:
+            continue
+        try:
+            eyeL, eyeR = eyes
+            ears[t] = 0.5 * (eye_aspect_ratio_6pts(eyeL) + eye_aspect_ratio_6pts(eyeR))
+        except Exception:
+            pass
+    return ears

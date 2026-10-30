@@ -42,7 +42,6 @@ REF_RADIUS_DEFAULT = 120.0      # 얼굴 검출이 부족할 때 기본 반경(p
 
 # EAR / 졸음
 EAR_BASELINE_DEFAULT = 0.25     # baseline 계산 전 기본값
-EAR_BASELINE_WARMUP_FRAMES = 40 # baseline 수집 구간 (첫 세그먼트 내 프레임 인덱스 상한)
 EAR_BASELINE_MIN_SAMPLES = 30   # compute_EAR_baseline 최소 샘플 수
 EYE_CLOSURE_RATIO = 0.55        # EAR < baseline * ratio 이면 감김
 CLOSURE_LONG_SEC = 2.0          # 이 시간 이상 감김 지속 시 졸음

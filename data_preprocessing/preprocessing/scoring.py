@@ -7,8 +7,6 @@ import numpy as np
 from .config import (
     CLOSURE_LONG_SEC,
     DEFAULT_SCORING_PARAMS,
-    EAR_BASELINE_DEFAULT,
-    EAR_BASELINE_WARMUP_FRAMES,
     EYE_CLOSURE_RATIO,
     HEAD_NOD_THRESH,
     PHONE_USE_THRESH,
@@ -22,10 +20,10 @@ from .features import (
     angle_from_horizontal,
     center_of_bbox,
     compute_EAR_baseline,
-    eye_aspect_ratio_6pts,
     get_pose_xy,
     is_eye_closure,
     to_score,
+    compute_ear_series,
 )
 
 
@@ -77,9 +75,9 @@ def compute_segment_scores_7features(
     if ref_center is None or ref_radius is None:
         ref_center, ref_radius = _auto_reference(face_bboxes, segment_size)
 
-    # EAR baseline (첫 세그먼트 끝에서 계산, 이후 세그먼트에서 재사용)
-    baseline_buffer = []
-    ear_baseline_global = EAR_BASELINE_DEFAULT
+    # EAR baseline (영상 앞부분의 유효 EAR 30개의 중앙값)
+    ears = compute_ear_series(eyes_landmarks)
+    ear_baseline = float(compute_EAR_baseline(ears))
 
     closure_long_frames = max(1, int(round(CLOSURE_LONG_SEC * fps)))
     closure_frames = 0  # 세그먼트 경계를 넘어 누적
@@ -87,7 +85,6 @@ def compute_segment_scores_7features(
     for seg_idx in range(num_segments):
         s = seg_idx * segment_size
         e = s + segment_size
-        EAR_baseline = ear_baseline_global
 
         phone_use_flags = []
         head_angles = []
@@ -170,52 +167,34 @@ def compute_segment_scores_7features(
             # ---------------------
             # 4) EAR 기반 깜빡임 / 졸음
             # ---------------------
-            if eyes_landmarks[t] is not None:
-                try:
-                    eyeL, eyeR = eyes_landmarks[t]
-                    earL = eye_aspect_ratio_6pts(eyeL)
-                    earR = eye_aspect_ratio_6pts(eyeR)
-                    ear = 0.5 * (earL + earR)
-                    ear_series.append(ear)
+            ear = ears[t]
+            if np.isfinite(ear):
+                ear_series.append(ear)
 
-                    if seg_idx == 0 and t < EAR_BASELINE_WARMUP_FRAMES:
-                        baseline_buffer.append(ear)
+                # EAR이 baseline의 55% 미만이면 감김
+                closed = is_eye_closure(ear, ear_baseline, ratio=EYE_CLOSURE_RATIO)
+                if debug and seg_idx < 3:
+                    print(
+                        f"[seg {seg_idx}, t={t}] ear={ear:.4f}, baseline={ear_baseline:.4f}, "
+                        f"threshold={ear_baseline * EYE_CLOSURE_RATIO:.4f}, closed={closed}"
+                    )
 
-                    if seg_idx == 0 and t == e - 1:
-                        EAR_baseline = compute_EAR_baseline(baseline_buffer)
-                        ear_baseline_global = EAR_baseline
-                    else:
-                        EAR_baseline = ear_baseline_global
+                # 감김 -> 뜸 전환 = 깜빡임 1회
+                if prev_closed is not None and prev_closed and not closed:
+                    blink_transitions += 1
+                prev_closed = closed
 
-                    # EAR이 baseline의 55% 미만이면 감김
-                    closed = is_eye_closure(ear, EAR_baseline, ratio=EYE_CLOSURE_RATIO)
+                if closed:
+                    closure_frames += 1
+                else:
+                    closure_frames = 0
+                closure_long = closure_frames >= closure_long_frames
 
-                    if debug and seg_idx < 3:
-                        print(
-                            f"[seg {seg_idx}, t={t}] ear={ear:.4f}, baseline={EAR_baseline:.4f}, "
-                            f"threshold={EAR_baseline * EYE_CLOSURE_RATIO:.4f}, closed={closed}"
-                        )
+                head_nod = False
+                if len(head_angles) >= 3:
+                    head_nod = head_angles[-1] - head_angles[-3] > HEAD_NOD_THRESH
 
-                    # 감김 → 뜸 전환 = 깜빡임 1회
-                    if prev_closed is not None and prev_closed and not closed:
-                        blink_transitions += 1
-                    prev_closed = closed
-
-                    if closed:
-                        closure_frames += 1
-                    else:
-                        closure_frames = 0
-
-                    closure_long = closure_frames >= closure_long_frames
-
-                    head_nod = False
-                    if len(head_angles) >= 3:
-                        head_nod = head_angles[-1] - head_angles[-3] > HEAD_NOD_THRESH
-
-                    sleepy_flags.append(closure_long or head_nod)
-
-                except Exception:
-                    ear_series.append(np.nan)
+                sleepy_flags.append(closure_long or head_nod)
 
         # -------------------------------
         # 세그먼트 점수
@@ -272,7 +251,7 @@ def compute_segment_scores_7features(
                 "usage_ratio": round(usage_ratio, 4),
                 "sleepy_flag": int(segment_sleepy),
                 "blink_rate_proxy": round(blink_rate_proxy, 5),
-                "EAR_baseline": round(EAR_baseline, 4),
+                "EAR_baseline": round(ear_baseline, 4),
             },
             "flags": {
                 "seat_departed": seat_departed,
