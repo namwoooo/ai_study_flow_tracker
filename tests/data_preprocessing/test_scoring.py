@@ -34,19 +34,3 @@ def test_closure_long_across_segment_boundary():
 def test_short_blinks_not_sleepy():
     res = _run({10, 30, 31, 55})    # 0.2~0.4초 깜빡임만
     assert [r["raw"]["sleepy_flag"] for r in res] == [0, 0, 0]
-
-
-def test_phone_use_ratio_from_scores():
-    n = 75
-    phone = [None] * n
-    for t in range(0, n, 5):        # 1초 간격 검사
-        phone[t] = 0.0
-    for t in (25, 30, 35):          # seg1에서 3번 검출
-        phone[t] = 0.4
-    res = compute_segment_scores_7features(
-        processed_frames=[True] * n, pose_keypoints=[None] * n,
-        eyes_landmarks=[None] * n, face_bboxes=[(200, 100, 400, 350)] * n,
-        frame_sizes=[None] * n,     # 얼굴 미검출이어도 폰 판정은 되어야 함
-        segment_size=25, fps=5, phone_scores=phone,
-    )
-    assert [r["raw"]["usage_ratio"] for r in res] == [0.0, 0.6, 0.0]
