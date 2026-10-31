@@ -54,7 +54,8 @@ def run(
         face_model_path=FACE_MODEL_PATH,
         pose_model_path=POSE_MODEL_PATH,
         warmup_segments=WARMUP_SEGMENTS,
-        phone_bboxes=None,
+        phone_detector=None,
+        detect_phone=True,
         debug=False,
 ):
     """
@@ -78,7 +79,7 @@ def run(
         face_bboxes=lm["face_bboxes"],
         frame_sizes=lm["frame_sizes"],
         segment_size=segment_size,
-        phone_bboxes=phone_bboxes,
+        phone_scores=lm["phone_scores"],
         debug=debug,
         fps=target_fps
     )
@@ -99,6 +100,7 @@ def run(
             "face": lm["timing"]["face"],
             "pose": lm["timing"]["pose"],
             "skip": lm["timing"]["skip"],
+            "phone": lm["timing"]["phone"],
             "scoring": t_scoring,
             "total": time.time() - t_start,
         },
