@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from data_preprocessing.preprocessing.scoring import compute_segment_scores_7features
 
 
@@ -34,3 +35,15 @@ def test_closure_long_across_segment_boundary():
 def test_short_blinks_not_sleepy():
     res = _run({10, 30, 31, 55})    # 0.2~0.4초 깜빡임만
     assert [r["raw"]["sleepy_flag"] for r in res] == [0, 0, 0]
+
+
+def test_perclos_ratio_uses_trailing_window():
+    res = _run(set(range(20, 32)))   # 12프레임 감김
+    ratios = [r["raw"]["perclos_ratio"] for r in res]
+    # seg0: 5/25, seg1: 12/50, seg2: 12/75
+    assert ratios == pytest.approx([0.2, 0.24, 0.16], abs=1e-4)
+
+
+def test_perclos_no_closure_is_full_score():
+    res = _run(set())
+    assert all(r["scores"]["perclos"] == 1.0 for r in res)
