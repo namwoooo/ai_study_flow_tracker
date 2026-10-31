@@ -9,7 +9,7 @@ from .config import (
     DEFAULT_SCORING_PARAMS,
     EYE_CLOSURE_RATIO,
     HEAD_NOD_THRESH,
-    PHONE_SCORE_THRESH,
+    PHONE_USE_THRESH,
     REF_RADIUS_DEFAULT,
     REF_RADIUS_MIN,
     REF_WINDOW_MIN,
@@ -59,7 +59,7 @@ def compute_segment_scores_7features(
         face_bboxes,
         frame_sizes,
         segment_size,
-        phone_scores=None,
+        phone_bboxes=None,
         ref_center=None,
         ref_radius=None,
         params=None,
@@ -98,16 +98,32 @@ def compute_segment_scores_7features(
         sleepy_flags = []
 
         for t in range(s, e):
-            # 1) 폰 사용: 얼굴 미검출 프레임에서도 판정
-            if phone_scores is not None and phone_scores[t] is not None:
-                phone_use_flags.append(phone_scores[t] >= PHONE_SCORE_THRESH)
-
             if frame_sizes[t] is None:
                 continue
-
             w, h = frame_sizes[t]
             fb = face_bboxes[t]
             fc = center_of_bbox(fb) if fb is not None else None
+
+            # ---------------------
+            # 1) 폰 사용 (손-폰 거리)
+            # ---------------------
+            if phone_bboxes is not None and phone_bboxes[t] is not None:
+                p = pose_keypoints[t]
+                hand_center = None
+                if p is not None:
+                    wL = get_pose_xy(p, POSE_IDX["wrist_l"], w, h)
+                    wR = get_pose_xy(p, POSE_IDX["wrist_r"], w, h)
+                    ws = [x for x in (wL, wR) if x is not None]
+                    if ws:
+                        hand_center = np.mean(np.array(ws), axis=0)
+
+                if hand_center is not None:
+                    d_hp = np.linalg.norm(center_of_bbox(phone_bboxes[t]) - hand_center)
+                    phone_use_flags.append(d_hp < PHONE_USE_THRESH)
+                else:
+                    phone_use_flags.append(False)
+            else:
+                phone_use_flags.append(False)
 
             # ---------------------
             # 2) 고개 각도

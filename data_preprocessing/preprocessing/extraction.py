@@ -7,7 +7,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from .config import FACE_MODEL_PATH, POSE_MODEL_PATH, TARGET_FPS, PHONE_DETECT_INTERVAL_SEC, PHONE_MODEL_ID, PHONE_SCORE_THRESH
+from .config import FACE_MODEL_PATH, POSE_MODEL_PATH, TARGET_FPS
 from .features import LEFT_EYE_IDXS, RIGHT_EYE_IDXS
 
 BaseOptions = mp.tasks.BaseOptions
@@ -40,20 +40,10 @@ def _append_empty(frames):
         frames[key].append(None)
 
 
-def _process_sampled_frame(frame_bgr, timestamp_ms, mp_face, mp_pose, frames, timing,
-                           phone_detector=None, check_phone=False):
+def _process_sampled_frame(frame_bgr, timestamp_ms, mp_face, mp_pose, frames, timing):
     """샘플링된 프레임 1개에 대해 face/pose 랜드마크를 추출해 frames에 append."""
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     h, w, _ = frame_bgr.shape
-
-    # --- Phone (얼굴 검출과 무관하게 먼저 수행) ---
-    if phone_detector is not None and check_phone:
-        _tph = time.time()
-        frames["phone_scores"].append(phone_detector.max_score(frame_rgb))
-        timing["phone"] += time.time() - _tph
-    else:
-        frames["phone_scores"].append(None)   # 검사 안 함
-
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
     # --- Face ---
@@ -115,7 +105,6 @@ def extract_landmarks(
         target_fps=TARGET_FPS,
         face_model_path=FACE_MODEL_PATH,
         pose_model_path=POSE_MODEL_PATH,
-        phone_detector=None,
 ):
     """영상을 target_fps로 샘플링하며 프레임별 랜드마크를 추출한다.
 
@@ -133,9 +122,7 @@ def extract_landmarks(
 
     face_opts, pose_opts = _build_options(face_model_path, pose_model_path)
     frames = {key: [] for key in FRAME_KEYS}
-    frames["phone_scores"] = []
-    timing = {"total": 0.0, "face": 0.0, "pose": 0.0, "skip": 0.0, "phone": 0.0}
-    phone_interval = max(1, round(PHONE_DETECT_INTERVAL_SEC * target_fps))
+    timing = {"total": 0.0, "face": 0.0, "pose": 0.0, "skip": 0.0}
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -166,12 +153,7 @@ def extract_landmarks(
 
                     t_sec = (frame_idx - 1) / native_fps
                     timestamp_ms = int(t_sec * 1000)
-                    sample_idx = len(frames["processed_frames"])
-                    _process_sampled_frame(
-                        frame_bgr, timestamp_ms, mp_face, mp_pose, frames, timing,
-                        phone_detector=phone_detector,
-                        check_phone=(sample_idx % phone_interval == 0),
-                    )
+                    _process_sampled_frame(frame_bgr, timestamp_ms, mp_face, mp_pose, frames, timing)
                 else:
                     _ts = time.time()
                     ret = cap.grab()
@@ -190,31 +172,3 @@ def extract_landmarks(
         "native_fps": native_fps,
         "timing": timing,
     }
-
-
-class PhoneDetector:
-    """RT-DETR 기반 폰 검출기"""
-    def __init__(self, model_id=PHONE_MODEL_ID, device=None, score_thresh=PHONE_SCORE_THRESH):
-        import torch
-        from transformers import RTDetrForObjectDetection, RTDetrImageProcessor
-
-        self._torch = torch
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.score_thresh = score_thresh
-        self.proc = RTDetrImageProcessor.from_pretrained(model_id)
-        self.model = RTDetrForObjectDetection.from_pretrained(model_id).to(self.device).eval()
-        self.phone_ids = {i for i, n in self.model.config.id2label.items() if n == "cell phone"}
-        if not self.phone_ids:
-            raise ValueError(f"{model_id}에 'cell phone' 클래스가 없음")
-
-    def max_score(self, frame_rgb):
-        """프레임 내 폰 최고 점수. 임계값 미만이면 0.0"""
-        torch = self._torch
-        h, w = frame_rgb.shape[:2]
-        inputs = self.proc(images=frame_rgb, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            out = self.model(**inputs)
-        res = self.proc.post_process_object_detection(
-            out, target_sizes=torch.tensor([[h, w]]), threshold=self.score_thresh)[0]
-        scores = [s.item() for s, l in zip(res["scores"], res["labels"]) if l.item() in self.phone_ids]
-        return max(scores, default=0.0)

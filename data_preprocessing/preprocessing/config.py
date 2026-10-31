@@ -34,10 +34,7 @@ DEFAULT_SCORING_PARAMS = {
     "seat_departure_penalty": 0.0,
 }
 
-# 폰 검출 (RT-DETR, COCO "cell phone")
-PHONE_MODEL_ID = "PekingU/rtdetr_r18vd"
-PHONE_SCORE_THRESH = 0.15         # 양성 0.19~0.57, 음성 < 0.1
-PHONE_DETECT_INTERVAL_SEC = 1.0  # 1초에 한 번 검출
+PHONE_USE_THRESH = 25.0         # 손-폰 거리 임계값(px)
 
 # 자리 이탈 기준점 자동 설정
 REF_WINDOW_MIN = 30             # 기준점 계산에 쓰는 최소 초기 샘플 수
