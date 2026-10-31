@@ -16,7 +16,7 @@ CSV_COLUMNS = [
     "segment_idx",
     "phone_use", "seat_depart", "head_angle", "shoulder_tilt", "hand_face", "blink", "perclos",
     "final", "personalized", "personal_stability",
-    "usage_ratio", "sleepy_flag", "blink_rate_proxy", "EAR_baseline",
+    "usage_ratio", "sleepy_flag", "blink_rate_proxy", "perclos_ratio", "EAR_baseline",
     "seat_departed",
 ]
 
@@ -35,6 +35,7 @@ def segments_to_dataframe(personalized_segments):
             "hand_face": s["hand_face"],
             "blink": s["blink"],
             "perclos": s["perclos"],
+            "perclos_ratio": raw["perclos_ratio"],
             "final": s["final"],
             "personalized": s["personalized"],
             "personal_stability": s["personal_stability"],

@@ -13,7 +13,7 @@ from .config import (
     REF_RADIUS_DEFAULT,
     REF_RADIUS_MIN,
     REF_WINDOW_MIN,
-    TARGET_FPS,
+    TARGET_FPS, PERCLOS_WINDOW_SEC,
 )
 from .features import (
     POSE_IDX,
@@ -80,6 +80,12 @@ def compute_segment_scores_7features(
     ears = compute_ear_series(eyes_landmarks)
     ear_baseline = float(compute_EAR_baseline(ears))
 
+    # 프레임별 감김 여부
+    ear_valid = np.isfinite(ears)
+    closed_series = np.zeros(len(ears), dtype=bool)
+    closed_series[ear_valid] = ears[ear_valid] < ear_baseline * EYE_CLOSURE_RATIO
+    perclos_window = max(1, int(round(PERCLOS_WINDOW_SEC * fps)))
+
     closure_long_frames = max(1, int(round(CLOSURE_LONG_SEC * fps)))
     closure_frames = 0  # 세그먼트 경계를 넘어 누적
     prev_closed = None
@@ -93,7 +99,6 @@ def compute_segment_scores_7features(
         shoulder_tilts = []
         hand_face_scores = []
         seat_flags = []
-        ear_series = []
         blink_transitions = 0
         sleepy_flags = []
 
@@ -170,10 +175,9 @@ def compute_segment_scores_7features(
             # ---------------------
             ear = ears[t]
             if np.isfinite(ear):
-                ear_series.append(ear)
 
                 # EAR이 baseline의 55% 미만이면 감김
-                closed = is_eye_closure(ear, ear_baseline, ratio=EYE_CLOSURE_RATIO)
+                closed = bool(closed_series[t])
                 if debug and seg_idx < 3:
                     print(
                         f"[seg {seg_idx}, t={t}] ear={ear:.4f}, baseline={ear_baseline:.4f}, "
@@ -224,7 +228,16 @@ def compute_segment_scores_7features(
         blink_score = to_score(blink_rate_proxy, *P["norm"]["blink_rate_proxy"], small_is_good=True)
 
         segment_sleepy = any(sleepy_flags)
-        perclos_score = 1.0 - (1.0 if segment_sleepy else 0.0)
+
+        # PERCLOS: 세그먼트 끝 기준 직전 창의 감김 비율
+        w_start = max(0, e - perclos_window)
+        win_valid = ear_valid[w_start:e]
+        if win_valid.any():
+            perclos_ratio = float(closed_series[w_start:e][win_valid].mean())
+            perclos_score = to_score(perclos_ratio, *P["norm"]["perclos"], small_is_good=True)
+        else:
+            perclos_ratio = float("nan")
+            perclos_score = 0.5
 
         feature_scores = {
             "phone_use": phone_use_score,
@@ -248,6 +261,7 @@ def compute_segment_scores_7features(
                 "sleepy_flag": int(segment_sleepy),
                 "blink_rate_proxy": round(blink_rate_proxy, 5),
                 "EAR_baseline": round(ear_baseline, 4),
+                "perclos_ratio": round(perclos_ratio, 4),
             },
             "flags": {
                 "seat_departed": seat_departed,

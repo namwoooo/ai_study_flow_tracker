@@ -19,7 +19,7 @@ DEFAULT_SCORING_PARAMS = {
         "shoulder_tilt":    (0.0, 0.25),
         "hand_face_dist":   (30.0, 200.0),
         "blink_rate_proxy": (0.02, 0.30),
-        "perclos":          (0.00, 0.35),
+        "perclos":          (0.05, 0.25),   # 평상시 -0.05, 졸음 경계 -0.15
     },
     # 가중치는 합으로 정규화되므로 합이 1일 필요 없음
     "w": {
@@ -47,6 +47,7 @@ EAR_BASELINE_MIN_SAMPLES = 30   # compute_EAR_baseline 최소 샘플 수
 EYE_CLOSURE_RATIO = 0.55        # EAR < baseline * ratio 이면 감김
 CLOSURE_LONG_SEC = 2.0          # 이 시간 이상 감김 지속 시 졸음
 HEAD_NOD_THRESH = 0.15          # head nod 판정 각도 변화(rad)
+PERCLOS_WINDOW_SEC = 60         # PERCLOS 계산 창(세그먼트 끝 기준 직전 N초)
 
 # 해당 값 미만의 pose 랜드마크 무시
 POSE_VIS_THRESH = 0.5
