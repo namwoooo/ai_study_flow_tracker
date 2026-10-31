@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 from data_preprocessing.preprocessing.scoring import compute_segment_scores_7features
-
+from data_preprocessing.preprocessing.features import POSE_IDX
 
 def _eye(x0, d, y=200):
     return np.array([[x0, y], [x0+10, y-d], [x0+20, y-d],
@@ -47,3 +47,24 @@ def test_perclos_ratio_uses_trailing_window():
 def test_perclos_no_closure_is_full_score():
     res = _run(set())
     assert all(r["scores"]["perclos"] == 1.0 for r in res)
+
+def _pose(wrist_xy=None, w=640, h=480):
+    vec = [0.0] * (33 * 4)            # visibility 0 → 모든 랜드마크 무시
+    if wrist_xy is not None:
+        i = POSE_IDX["wrist_r"] * 4
+        vec[i:i + 4] = [wrist_xy[0] / w, wrist_xy[1] / h, 0.0, 1.0]
+    return vec
+
+
+def test_hand_face_absent_and_near():
+    n = 50
+    # 얼굴 bbox (200,100,400,350) → 중심 (300,225), 높이 250
+    # seg1: 손목이 중심에서 100px 아래 → 0.4배 → 0점
+    pose = [_pose() for _ in range(25)] + [_pose((300, 325)) for _ in range(25)]
+    res = compute_segment_scores_7features(
+        processed_frames=[True] * n, pose_keypoints=pose, eyes_landmarks=[None] * n,
+        face_bboxes=[(200, 100, 400, 350)] * n, frame_sizes=[(640, 480)] * n,
+        segment_size=25, fps=5,
+    )
+    assert [r["scores"]["hand_face"] for r in res] == [1.0, 0.0]
+    assert [r["raw"]["hand_visible_ratio"] for r in res] == [0.0, 1.0]

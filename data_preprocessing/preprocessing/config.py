@@ -17,7 +17,7 @@ DEFAULT_SCORING_PARAMS = {
     "norm": {
         "head_angle_rad":   (0.0, 0.35),
         "shoulder_tilt":    (0.0, 0.25),
-        "hand_face_dist":   (30.0, 200.0),
+        "hand_face_dist":   (0.5, 2.0),
         "blink_rate_proxy": (0.02, 0.30),
         "perclos":          (0.05, 0.25),   # 평상시 -0.05, 졸음 경계 -0.15
     },
@@ -68,7 +68,7 @@ STABILITY_FILTER = {
 BASELINE_DEFAULT_MEANS = {
     "head":     0.7,
     "shoulder": 0.7,
-    "hand":     0.5,
+    "hand":     1.0,
     "blink":    0.05,
     "phone":    0.9,
 }
@@ -87,3 +87,5 @@ SLEEPY_PENALTY = 0.5            # 졸음 시 stability에 곱함 (50% 감점)
 
 FINAL_MIX_WEIGHT = 0.6          # personalized = 0.6 * final + 0.4 * stability
 STABILITY_MIX_WEIGHT = 0.4
+
+HAND_ABSENT_SCORE = 1.0  # 손목이 화면에 없을 때 (책상 위로 간주)

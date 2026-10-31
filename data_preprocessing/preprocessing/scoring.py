@@ -13,7 +13,7 @@ from .config import (
     REF_RADIUS_DEFAULT,
     REF_RADIUS_MIN,
     REF_WINDOW_MIN,
-    TARGET_FPS, PERCLOS_WINDOW_SEC,
+    TARGET_FPS, PERCLOS_WINDOW_SEC, HAND_ABSENT_SCORE,
 )
 from .features import (
     POSE_IDX,
@@ -98,6 +98,7 @@ def compute_segment_scores_7features(
         head_angles = []
         shoulder_tilts = []
         hand_face_scores = []
+        hand_visible_flags = []
         seat_flags = []
         blink_transitions = 0
         sleepy_flags = []
@@ -149,16 +150,19 @@ def compute_segment_scores_7features(
                 if sL and sR:
                     shoulder_tilts.append(angle_from_horizontal(sL, sR))
 
-                if fc is not None:
+                if fb is not None:
                     wL = get_pose_xy(p, POSE_IDX["wrist_l"], w, h)
                     wR = get_pose_xy(p, POSE_IDX["wrist_r"], w, h)
                     ws = [x for x in (wL, wR) if x is not None]
+                    hand_visible_flags.append(bool(ws))
                     if ws:
-                        hand_center = np.mean(np.array(ws), axis=0)
-                        d_hf = np.linalg.norm(hand_center - fc)
+                        face_h = max(1.0, fb[3] - fb[1])
+                        d_norm = min(np.linalg.norm(np.array(x) - fc) for x in ws) / face_h
                         hand_face_scores.append(
-                            to_score(d_hf, *P["norm"]["hand_face_dist"], small_is_good=False)
+                            to_score(d_norm, *P["norm"]["hand_face_dist"], small_is_good=False)
                         )
+                    else:
+                        hand_face_scores.append(HAND_ABSENT_SCORE)
 
                 nose = get_pose_xy(p, POSE_IDX["nose"], w, h)
                 if nose is None:
@@ -223,6 +227,7 @@ def compute_segment_scores_7features(
             shoulder_tilt_score = 0.5
 
         hand_face_score = np.mean(hand_face_scores) if hand_face_scores else 0.5
+        hand_visible_ratio = float(np.mean(hand_visible_flags)) if hand_visible_flags else 0.0
 
         blink_rate_proxy = blink_transitions / max(1, (e - s))
         blink_score = to_score(blink_rate_proxy, *P["norm"]["blink_rate_proxy"], small_is_good=True)
@@ -262,6 +267,7 @@ def compute_segment_scores_7features(
                 "blink_rate_proxy": round(blink_rate_proxy, 5),
                 "EAR_baseline": round(ear_baseline, 4),
                 "perclos_ratio": round(perclos_ratio, 4),
+                "hand_visible_ratio": round(hand_visible_ratio, 4),
             },
             "flags": {
                 "seat_departed": seat_departed,

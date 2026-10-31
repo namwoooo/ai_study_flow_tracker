@@ -14,7 +14,7 @@ from .scoring import compute_segment_scores_7features
 
 CSV_COLUMNS = [
     "segment_idx",
-    "phone_use", "seat_depart", "head_angle", "shoulder_tilt", "hand_face", "blink", "perclos",
+    "phone_use", "seat_depart", "head_angle", "shoulder_tilt", "hand_face", "hand_visible_ratio", "blink", "perclos",
     "final", "personalized", "personal_stability",
     "usage_ratio", "sleepy_flag", "blink_rate_proxy", "perclos_ratio", "EAR_baseline",
     "seat_departed",
@@ -33,6 +33,7 @@ def segments_to_dataframe(personalized_segments):
             "head_angle": s["head_angle"],
             "shoulder_tilt": s["shoulder_tilt"],
             "hand_face": s["hand_face"],
+            "hand_visible_ratio": raw["hand_visible_ratio"],
             "blink": s["blink"],
             "perclos": s["perclos"],
             "perclos_ratio": raw["perclos_ratio"],
