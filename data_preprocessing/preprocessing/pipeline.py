@@ -17,7 +17,7 @@ CSV_COLUMNS = [
     "phone_use", "seat_depart", "head_angle", "shoulder_tilt", "hand_face", "hand_visible_ratio", "blink", "perclos",
     "final", "personalized", "personal_stability",
     "usage_ratio", "sleepy_flag", "blink_rate_proxy", "perclos_ratio", "EAR_baseline",
-    "seat_departed",
+    "seat_departed", "head_pose", "head_yaw_dev", "head_up_dev", "head_down_dev"
 ]
 
 def score_landmarks(lm, target_fps=TARGET_FPS, segment_sec=SEGMENT_SEC,
@@ -27,6 +27,7 @@ def score_landmarks(lm, target_fps=TARGET_FPS, segment_sec=SEGMENT_SEC,
         processed_frames=lm["processed_frames"], pose_keypoints=lm["pose_keypoints"],
         eyes_landmarks=lm["eyes_landmarks"], face_bboxes=lm["face_bboxes"],
         frame_sizes=lm["frame_sizes"], segment_size=target_fps * segment_sec,
+        head_pose=lm.get("head_pose"),
         phone_bboxes=phone_bboxes, fps=target_fps, debug=debug,
     )
     baseline = compute_personal_baseline_stability_filtered(seg_results, warmup_segments)
@@ -57,6 +58,10 @@ def segments_to_dataframe(personalized_segments):
             "blink_rate_proxy": raw["blink_rate_proxy"],
             "EAR_baseline": raw["EAR_baseline"],
             "seat_departed": flg["seat_departed"],
+            "head_pose": s["head_pose"],
+            "head_yaw_dev": raw["head_yaw_dev"],
+            "head_up_dev": raw["head_up_dev"],
+            "head_down_dev": raw["head_down_dev"],
         })
     return pd.DataFrame(rows, columns=CSV_COLUMNS).round(3)
 
@@ -85,7 +90,9 @@ def run(
     # 2) 세그먼트 점수
     t1 = time.time()
     df, baseline, seg_results = score_landmarks(
-        lm, target_fps, segment_sec, warmup_segments, phone_bboxes, debug)
+        lm, target_fps=target_fps, segment_sec=segment_sec,
+        warmup_segments=warmup_segments, phone_bboxes=phone_bboxes, debug=debug,
+    )
     t_scoring = time.time() - t1
 
     info = {

@@ -20,6 +20,8 @@ DEFAULT_SCORING_PARAMS = {
         "hand_face_dist":   (0.5, 2.0),
         "blink_rate_proxy": (0.02, 0.30),
         "perclos":          (0.05, 0.25),   # 평상시 -0.05, 졸음 경계 -0.15
+        "head_yaw_deg":     (6.0, 15.0),   # focus 세그먼트 p90 ≈ 6°, away_speaking p50 ≈ 10~12°
+        "head_up_deg":      (4.0, 20.0),   # focus p90 ≈ 4°, look_up p50 ≈ 23~26°
     },
     # 가중치는 합으로 정규화되므로 합이 1일 필요 없음
     "w": {
@@ -30,6 +32,7 @@ DEFAULT_SCORING_PARAMS = {
         "hand_face":     0.16,
         "blink":         0.16,
         "perclos":       0.16,
+        "head_pose":     0.16,
     },
     "seat_departure_penalty": 0.0,
 }
@@ -41,6 +44,8 @@ BLENDSHAPE_KEYS = (
     "eyeLookInLeft", "eyeLookOutLeft", "eyeLookUpLeft", "eyeLookDownLeft",
     "eyeLookInRight", "eyeLookOutRight", "eyeLookUpRight", "eyeLookDownRight",
 )
+
+HEAD_REF_WINDOW_SEC = 600   # 기준 자세 = 직전 10분 head pose 중앙값 (과거만 사용 → 실시간 가능)
 
 PHONE_USE_THRESH = 25.0         # 손-폰 거리 임계값(px)
 

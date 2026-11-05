@@ -84,3 +84,16 @@ def _mat(pitch=0.0, yaw=0.0, roll=0.0, scale=1.7):
 @pytest.mark.parametrize("pitch,yaw,roll", [(0, 0, 0), (15, 0, 0), (0, -25, 0), (0, 0, 10), (-10, 20, 5)])
 def test_matrix_to_euler_deg(pitch, yaw, roll):
     assert matrix_to_euler_deg(_mat(pitch, yaw, roll)) == pytest.approx((pitch, yaw, roll), abs=1e-6)
+
+
+def test_head_pose_yaw_and_up_penalized_down_tolerated():
+    n = 100
+    hp = [(-5.0, -2.0, 0.0)] * 50          # seg0, seg1: 기준 자세
+    hp += [(-5.0, -22.0, 0.0)] * 25        # seg2: 옆으로 20°
+    hp += [(15.0, -2.0, 0.0)] * 25         # seg3: 아래로 20° (필기) → 감점 없음
+    res = compute_segment_scores_7features(
+        processed_frames=[True] * n, pose_keypoints=[None] * n, eyes_landmarks=[None] * n,
+        face_bboxes=[(200, 100, 400, 350)] * n, frame_sizes=[(640, 480)] * n,
+        segment_size=25, fps=5, head_pose=hp,
+    )
+    assert [r["scores"]["head_pose"] for r in res] == [1.0, 1.0, 0.0, 1.0]

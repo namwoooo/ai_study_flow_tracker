@@ -13,7 +13,7 @@ from .config import (
     REF_RADIUS_DEFAULT,
     REF_RADIUS_MIN,
     REF_WINDOW_MIN,
-    TARGET_FPS, PERCLOS_WINDOW_SEC, HAND_ABSENT_SCORE,
+    TARGET_FPS, PERCLOS_WINDOW_SEC, HAND_ABSENT_SCORE, HEAD_REF_WINDOW_SEC,
 )
 from .features import (
     POSE_IDX,
@@ -64,6 +64,7 @@ def compute_segment_scores_7features(
         ref_radius=None,
         params=None,
         fps=TARGET_FPS,
+        head_pose=None,
         debug=False,
 ):
     T = len(processed_frames)
@@ -89,6 +90,14 @@ def compute_segment_scores_7features(
     closure_long_frames = max(1, int(round(CLOSURE_LONG_SEC * fps)))
     closure_frames = 0  # 세그먼트 경계를 넘어 누적
     prev_closed = None
+
+    # head pose (pitch −: 위, yaw −: 영상 기준 왼쪽)
+    if head_pose is not None:
+        hp = np.array([x if x is not None else (np.nan,) * 3 for x in head_pose], dtype=float)
+        pitch_s, yaw_s = hp[:, 0], hp[:, 1]
+    else:
+        pitch_s = yaw_s = np.full(T, np.nan)
+    head_ref_window = max(1, int(round(HEAD_REF_WINDOW_SEC * fps)))
 
     for seg_idx in range(num_segments):
         s = seg_idx * segment_size
@@ -234,6 +243,23 @@ def compute_segment_scores_7features(
 
         segment_sleepy = any(sleepy_flags)
 
+        # head pose: 직전 10분(첫 세그먼트는 자기 자신) 중앙값을 기준 자세로, 위·좌우 이탈만 감점
+        r0 = max(0, s - head_ref_window)
+        r1 = s if s > 0 else e
+        ref_p, ref_y = np.nanmedian(pitch_s[r0:r1]), np.nanmedian(yaw_s[r0:r1])
+        dp, dy = pitch_s[s:e] - ref_p, yaw_s[s:e] - ref_y
+        if np.isfinite(dp).any() and np.isfinite(ref_p):
+            yaw_dev = float(np.nanmedian(np.abs(dy)))
+            up_dev = float(np.nanmedian(np.clip(-dp, 0, None)))
+            down_dev = float(np.nanmedian(np.clip(dp, 0, None)))
+            head_pose_score = min(
+                to_score(yaw_dev, *P["norm"]["head_yaw_deg"], small_is_good=True),
+                to_score(up_dev, *P["norm"]["head_up_deg"], small_is_good=True),
+            )
+        else:
+            yaw_dev = up_dev = down_dev = float("nan")
+            head_pose_score = 0.5
+
         # PERCLOS: 세그먼트 끝 기준 직전 창의 감김 비율
         w_start = max(0, e - perclos_window)
         win_valid = ear_valid[w_start:e]
@@ -252,6 +278,7 @@ def compute_segment_scores_7features(
             "hand_face": hand_face_score,
             "blink": blink_score,
             "perclos": perclos_score,
+            "head_pose": head_pose_score,
         }
         final_score = weighted_mean(feature_scores, W)
 
@@ -268,6 +295,9 @@ def compute_segment_scores_7features(
                 "EAR_baseline": round(ear_baseline, 4),
                 "perclos_ratio": round(perclos_ratio, 4),
                 "hand_visible_ratio": round(hand_visible_ratio, 4),
+                "head_yaw_dev": round(yaw_dev, 2),
+                "head_up_dev": round(up_dev, 2),
+                "head_down_dev": round(down_dev, 2),
             },
             "flags": {
                 "seat_departed": seat_departed,
