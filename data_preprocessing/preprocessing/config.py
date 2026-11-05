@@ -25,8 +25,8 @@ DEFAULT_SCORING_PARAMS = {
     },
     # 가중치는 합으로 정규화되므로 합이 1일 필요 없음
     "w": {
-        "phone_use":     0.0,    #TODO: 폰 검출 미구현
-        "seat_depart":   0.12,
+        "phone_use":     0.0,
+        "seat_depart":   0.0,     # 자리 비움은 status(absent) 처리, 점수에서 제외
         "head_angle":    0.12,
         "shoulder_tilt": 0.12,
         "hand_face":     0.16,
@@ -46,6 +46,8 @@ BLENDSHAPE_KEYS = (
 )
 
 HEAD_REF_WINDOW_SEC = 600   # 기준 자세 = 직전 10분 head pose 중앙값 (과거만 사용 → 실시간 가능)
+
+BODY_MIN_WIDTH_RATIO = 0.6      # 어깨 폭이 평소(얼굴 보일 때)의 이 비율 이상이어야 책상 앞의 몸으로 인정
 
 PHONE_USE_THRESH = 25.0         # 손-폰 거리 임계값(px)
 
@@ -95,7 +97,8 @@ STABILITY_WEIGHTS = {
     "phone":    0.0,
 }
 
-SEAT_DEPART_PENALTY = 0.3       # 자리 이탈 시 stability에 곱함 (70% 감점)
+ABSENT_FACE_MISSING_RATIO = 0.6   # 세그먼트 내 얼굴 미검출 비율이 이 이상이면 자리 비움
+BODY_VISIBLE_RATIO = 0.5   # 얼굴이 없어도 양 어깨가 보이는 샘플 비율이 이 이상이면 face_hidden(자리에 있음)
 SLEEPY_PENALTY = 0.5            # 졸음 시 stability에 곱함 (50% 감점)
 
 FINAL_MIX_WEIGHT = 0.6          # personalized = 0.6 * final + 0.4 * stability

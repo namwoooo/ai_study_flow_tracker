@@ -13,7 +13,10 @@ from .config import (
     REF_RADIUS_DEFAULT,
     REF_RADIUS_MIN,
     REF_WINDOW_MIN,
-    TARGET_FPS, PERCLOS_WINDOW_SEC, HAND_ABSENT_SCORE, HEAD_REF_WINDOW_SEC,
+    TARGET_FPS, PERCLOS_WINDOW_SEC,
+    HAND_ABSENT_SCORE, HEAD_REF_WINDOW_SEC,
+    ABSENT_FACE_MISSING_RATIO, BODY_VISIBLE_RATIO,
+    BODY_MIN_WIDTH_RATIO,
 )
 from .features import (
     POSE_IDX,
@@ -25,6 +28,7 @@ from .features import (
     to_score,
     compute_ear_series,
     weighted_mean,
+    shoulder_width,
 )
 
 
@@ -98,6 +102,10 @@ def compute_segment_scores_7features(
     else:
         pitch_s = yaw_s = np.full(T, np.nan)
     head_ref_window = max(1, int(round(HEAD_REF_WINDOW_SEC * fps)))
+
+    # 몸 크기 기준: 얼굴이 보인 샘플의 어깨 폭 (멀리 있는 사람·물체와 책상 앞 사람 구분용)
+    sw_s = np.array([shoulder_width(p) for p in pose_keypoints])
+    face_ok = np.array([fs is not None for fs in frame_sizes])
 
     for seg_idx in range(num_segments):
         s = seg_idx * segment_size
@@ -280,7 +288,33 @@ def compute_segment_scores_7features(
             "perclos": perclos_score,
             "head_pose": head_pose_score,
         }
-        final_score = weighted_mean(feature_scores, W)
+        # 상태 판정: 얼굴이 대부분 없으면, 몸(양 어깨)이 보이는지로 자리 비움과 얼굴 가림을 구분
+        face_missing_ratio = sum(frame_sizes[t] is None for t in range(s, e)) / (e - s)
+        # 기준 어깨 폭: 직전 10분 중 얼굴이 보였던 샘플의 중앙값 (첫 세그먼트는 자기 자신)
+        ref_win = sw_s[r0:r1][face_ok[r0:r1]]
+        ref_sw = np.nanmedian(ref_win) if np.isfinite(ref_win).any() else np.nan
+        seg_sw = sw_s[s:e]
+        if np.isfinite(ref_sw):
+            body_ok = np.isfinite(seg_sw) & (seg_sw >= BODY_MIN_WIDTH_RATIO * ref_sw)
+        else:
+            body_ok = np.isfinite(seg_sw)        # 기준이 없으면 보이기만 하면 인정
+        body_visible_ratio = float(body_ok.mean())
+        body_width_rel = (float(np.nanmedian(seg_sw) / ref_sw)
+                          if np.isfinite(seg_sw).any() and np.isfinite(ref_sw) else float("nan"))
+
+        if face_missing_ratio < ABSENT_FACE_MISSING_RATIO:
+            status = "present"
+        elif body_visible_ratio >= BODY_VISIBLE_RATIO:
+            status = "face_hidden"   # 자리에 있지만 얼굴이 가려짐 (고개 숙임, 손으로 가림)
+        else:
+            status = "absent"
+
+        if status != "present":
+            # 얼굴 피처가 없으므로 점수를 비워 둠 (평균에서 자동 제외, 리포트에서 따로 집계)
+            feature_scores = {k: float("nan") for k in feature_scores}
+            final_score = float("nan")
+        else:
+            final_score = weighted_mean(feature_scores, W)
 
         results.append({
             "segment_idx": seg_idx,
@@ -298,9 +332,13 @@ def compute_segment_scores_7features(
                 "head_yaw_dev": round(yaw_dev, 2),
                 "head_up_dev": round(up_dev, 2),
                 "head_down_dev": round(down_dev, 2),
+                "face_missing_ratio": round(face_missing_ratio, 4),
+                "body_visible_ratio": round(body_visible_ratio, 4),
+                "body_width_rel": round(body_width_rel, 3),
             },
             "flags": {
-                "seat_departed": seat_departed,
+                "seat_departed": status == "absent",
+                "status": status,
             },
         })
 

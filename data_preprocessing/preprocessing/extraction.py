@@ -36,6 +36,22 @@ def _build_options(face_model_path, pose_model_path):
     return face_opts, pose_opts
 
 
+def _pose_vector(res_pose):
+    if not res_pose.pose_landmarks:
+        return None
+    vec = []
+    for lm_p in res_pose.pose_landmarks[0]:
+        vis = lm_p.visibility if lm_p.visibility is not None else 1.0
+        vec.extend([lm_p.x, lm_p.y, lm_p.z, vis])  # 33 x 4 (x, y, z, visibility)
+    return vec
+
+
+def _append_face_missing(frames, pose_vec):
+    """얼굴 검출 실패: 얼굴 관련 값은 None, pose는 검출 결과 유지."""
+    _append_empty(frames)
+    frames["pose_keypoints"][-1] = pose_vec
+
+
 def _append_empty(frames):
     """검출 실패 프레임: 모든 리스트에 None을 넣어 타임라인 길이를 맞춘다."""
     for key in FRAME_KEYS:
@@ -48,13 +64,18 @@ def _process_sampled_frame(frame_bgr, timestamp_ms, mp_face, mp_pose, frames, ti
     h, w, _ = frame_bgr.shape
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
+    # --- Pose ---
+    _tp = time.time()
+    pose_vec = _pose_vector(mp_pose.detect_for_video(mp_image, timestamp_ms))
+    timing["pose"] += time.time() - _tp
+
     # --- Face ---
     _tf = time.time()
     res_face = mp_face.detect_for_video(mp_image, timestamp_ms)
     timing["face"] += time.time() - _tf
 
     if not res_face.face_landmarks:
-        _append_empty(frames)
+        _append_face_missing(frames, pose_vec)
         return
 
     lm = res_face.face_landmarks[0]
@@ -64,13 +85,14 @@ def _process_sampled_frame(frame_bgr, timestamp_ms, mp_face, mp_pose, frames, ti
     ymin, ymax = int(y_coords.min() * h), int(y_coords.max() * h)
     xmin, ymin = max(0, xmin), max(0, ymin)
     xmax, ymax = min(w - 1, xmax), min(h - 1, ymax)
+
     if xmax <= xmin or ymax <= ymin:
-        _append_empty(frames)
+        _append_face_missing(frames, pose_vec)
         return
 
     face_crop = frame_bgr[ymin:ymax, xmin:xmax]
     if face_crop.size == 0:
-        _append_empty(frames)
+        _append_face_missing(frames, pose_vec)
         return
 
     frames["face_bboxes"].append((xmin, ymin, xmax, ymax))
@@ -96,20 +118,7 @@ def _process_sampled_frame(frame_bgr, timestamp_ms, mp_face, mp_pose, frames, ti
     except Exception:
         frames["eyes_landmarks"].append(None)
 
-    # --- Pose ---
-    _tp = time.time()
-    res_pose = mp_pose.detect_for_video(mp_image, timestamp_ms)
-    timing["pose"] += time.time() - _tp
-
-    if res_pose.pose_landmarks:
-        vec = []
-        for lm_p in res_pose.pose_landmarks[0]:
-            # 모든 랜드마크가 걸러지는 것 방지 위해 1.0 부여
-            vis = lm_p.visibility if lm_p.visibility is not None else 1.0
-            vec.extend([lm_p.x, lm_p.y, lm_p.z, vis])  # 33 x 4 (x, y, z, visibility)
-        frames["pose_keypoints"].append(vec)
-    else:
-        frames["pose_keypoints"].append(None)
+    frames["pose_keypoints"].append(pose_vec)
 
 
 def extract_landmarks(
@@ -124,8 +133,9 @@ def extract_landmarks(
     프레임이 없는 슬롯과 검출 실패 샘플은 None으로 채운다.
 
     Returns:
-        dict: processed_frames, face_bboxes, frame_sizes, eyes_landmarks, pose_keypoints,
-              t_ms(샘플별 실제 프레임 시각, 빈 슬롯은 None), num_frames, native_fps,
+        dict: processed_frames, face_bboxes, frame_sizes, eyes_landmarks,
+              pose_keypoints(얼굴이 없어도 몸이 검출되면 기록), head_pose((pitch, yaw, roll) 도),
+              blendshapes, t_ms(샘플별 실제 프레임 시각, 빈 슬롯은 None), num_frames, native_fps,
               timing{total, face, pose, skip}
     """
     for path in (video_path, face_model_path, pose_model_path):

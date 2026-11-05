@@ -97,3 +97,36 @@ def test_head_pose_yaw_and_up_penalized_down_tolerated():
         segment_size=25, fps=5, head_pose=hp,
     )
     assert [r["scores"]["head_pose"] for r in res] == [1.0, 1.0, 0.0, 1.0]
+
+
+import math
+
+def test_absent_segment_excluded():
+    n = 75
+    sizes = [(640, 480)] * 25 + [None] * 25 + [(640, 480)] * 25   # seg1: 얼굴 없음
+    res = compute_segment_scores_7features(
+        processed_frames=[True] * n, pose_keypoints=[None] * n, eyes_landmarks=[None] * n,
+        face_bboxes=[(200, 100, 400, 350)] * n, frame_sizes=sizes, segment_size=25, fps=5,
+    )
+    assert [r["flags"]["status"] for r in res] == ["present", "absent", "present"]
+    assert math.isnan(res[1]["scores"]["final"])
+    assert not math.isnan(res[0]["scores"]["final"])
+
+
+def _pose_shoulders():
+    vec = [0.0] * (33 * 4)
+    for k in ("shoulder_l", "shoulder_r"):
+        i = POSE_IDX[k] * 4
+        vec[i:i + 4] = [0.5, 0.8, 0.0, 1.0]
+    return vec
+
+
+def test_face_hidden_vs_absent():
+    n = 75
+    sizes = [(640, 480)] * 25 + [None] * 50                           # seg1, seg2: 얼굴 없음
+    pose = [None] * 25 + [_pose_shoulders()] * 25 + [None] * 25       # seg1만 어깨 보임
+    res = compute_segment_scores_7features(
+        processed_frames=[True] * n, pose_keypoints=pose, eyes_landmarks=[None] * n,
+        face_bboxes=[(200, 100, 400, 350)] * n, frame_sizes=sizes, segment_size=25, fps=5,
+    )
+    assert [r["flags"]["status"] for r in res] == ["present", "face_hidden", "absent"]

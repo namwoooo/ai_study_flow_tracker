@@ -5,7 +5,6 @@ import numpy as np
 from .config import (
     BASELINE_DEFAULT_MEANS,
     FINAL_MIX_WEIGHT,
-    SEAT_DEPART_PENALTY,
     SLEEPY_PENALTY,
     STABILITY_FILTER,
     STABILITY_MIX_WEIGHT,
@@ -34,7 +33,7 @@ def _is_stable(seg):
     sc, raw, flg = seg["scores"], seg["raw"], seg["flags"]
     f = STABILITY_FILTER
 
-    if flg["seat_departed"]:                           # 자리 이탈
+    if flg["status"] != "present":                           # 자리 이탈
         return False
     if raw["blink_rate_proxy"] > f["blink_rate_max"]:  # blink spike
         return False
@@ -96,6 +95,13 @@ def apply_personalization_with_delta(segment_results, baseline):
     for seg in segment_results:
         sc, raw, flg = seg["scores"], seg["raw"], seg["flags"]
 
+        if flg["status"] != "present":
+            seg_new = seg.copy()
+            seg_new["scores"] = {**seg["scores"], "personalized": float("nan"),
+                                 "personal_stability": float("nan")}
+            personalized.append(seg_new)
+            continue
+
         st_head = _stability(sc["head_angle"], b["head_mean"], b["head_std"])
         st_shoul = _stability(sc["shoulder_tilt"], b["shoulder_mean"], b["shoulder_std"])
         st_hand = _stability(sc["hand_face"], b["hand_mean"], b["hand_std"])
@@ -108,8 +114,6 @@ def apply_personalization_with_delta(segment_results, baseline):
             STABILITY_WEIGHTS,
         )
 
-        if flg["seat_departed"]:
-            personal_stability *= SEAT_DEPART_PENALTY
         if raw["sleepy_flag"] == 1:
             personal_stability *= SLEEPY_PENALTY
 

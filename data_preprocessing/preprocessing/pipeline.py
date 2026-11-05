@@ -17,7 +17,8 @@ CSV_COLUMNS = [
     "phone_use", "seat_depart", "head_angle", "shoulder_tilt", "hand_face", "hand_visible_ratio", "blink", "perclos",
     "final", "personalized", "personal_stability",
     "usage_ratio", "sleepy_flag", "blink_rate_proxy", "perclos_ratio", "EAR_baseline",
-    "seat_departed", "head_pose", "head_yaw_dev", "head_up_dev", "head_down_dev"
+    "seat_departed", "head_pose", "head_yaw_dev", "head_up_dev", "head_down_dev", "status", "face_missing_ratio",
+    "body_visible_ratio", "body_width_rel"
 ]
 
 def score_landmarks(lm, target_fps=TARGET_FPS, segment_sec=SEGMENT_SEC,
@@ -62,8 +63,44 @@ def segments_to_dataframe(personalized_segments):
             "head_yaw_dev": raw["head_yaw_dev"],
             "head_up_dev": raw["head_up_dev"],
             "head_down_dev": raw["head_down_dev"],
+            "status": flg["status"],
+            "face_missing_ratio": raw["face_missing_ratio"],
+            "body_visible_ratio": raw["body_visible_ratio"],
+            "body_width_rel": raw["body_width_rel"]
         })
     return pd.DataFrame(rows, columns=CSV_COLUMNS).round(3)
+
+
+def _episodes(mask):
+    """연속된 True 구간의 길이 목록"""
+    out, run = [], 0
+    for m in list(mask) + [False]:
+        if m:
+            run += 1
+        elif run:
+            out.append(run)
+            run = 0
+    return out
+
+
+def summarize_session(df, segment_sec=SEGMENT_SEC):
+    """LLM 리포트용 세션 요약. 집중도는 얼굴이 보인(present) 세그먼트 기준"""
+    to_min = lambda n: round(float(n * segment_sec / 60), 1)
+    absent = (df["status"] == "absent").to_numpy()
+    hidden = (df["status"] == "face_hidden").to_numpy()
+    absent_ep, hidden_ep = _episodes(absent), _episodes(hidden)
+    present = df[df["status"] == "present"]
+    return {
+        "total_min": to_min(len(df)),
+        "present_min": to_min(len(present)),
+        "absent_min": to_min(absent.sum()),
+        "absence_count": int(len(absent_ep)),
+        "longest_absence_min": to_min(max(absent_ep, default=0)),
+        "face_hidden_min": to_min(hidden.sum()),
+        "face_hidden_count": int(len(hidden_ep)),
+        "mean_final": round(float(present["final"].mean()), 3),
+        "mean_personalized": round(float(present["personalized"].mean()), 3),
+    }
 
 
 def run(

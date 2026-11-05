@@ -1,5 +1,3 @@
-from importlib.metadata import pass_none
-
 import numpy as np
 
 from .config import EAR_BASELINE_DEFAULT, EAR_BASELINE_MIN_SAMPLES, EYE_CLOSURE_RATIO, POSE_VIS_THRESH
@@ -111,3 +109,21 @@ def matrix_to_euler_deg(m):
     yaw = np.arctan2(-R[2, 0], np.hypot(R[2, 1], R[2, 2]))
     roll = np.arctan2(R[1, 0], R[0, 0])
     return tuple(float(v) for v in np.degrees([pitch, yaw, roll]))
+
+
+def pose_visible(pose_vec, idx, vis_thresh=POSE_VIS_THRESH):
+    """idx번 랜드마크가 보이는지 (좌표 계산 없이 visibility만 확인)."""
+    if pose_vec is None:
+        return False
+    base = idx * POSE_STRIDE
+    return base + 3 < len(pose_vec) and pose_vec[base + 3] >= vis_thresh
+
+
+def shoulder_width(pose_vec, vis_thresh=POSE_VIS_THRESH):
+    """양 어깨 사이 가로 거리 (화면 너비 대비 0~1). 어깨가 안 보이면 NaN."""
+    if pose_vec is None:
+        return float("nan")
+    l, r = POSE_IDX["shoulder_l"] * POSE_STRIDE, POSE_IDX["shoulder_r"] * POSE_STRIDE
+    if pose_vec[l + 3] < vis_thresh or pose_vec[r + 3] < vis_thresh:
+        return float("nan")
+    return abs(pose_vec[l] - pose_vec[r])
