@@ -105,3 +105,7 @@ FINAL_MIX_WEIGHT = 0.6          # personalized = 0.6 * final + 0.4 * stability
 STABILITY_MIX_WEIGHT = 0.4
 
 HAND_ABSENT_SCORE = 1.0  # 손목이 화면에 없을 때 (책상 위로 간주)
+
+EYE_GATE_DOWN_DEG = 5.0     # 기준 자세보다 이 이상 숙이면 눈 판정 불가 (아래 응시 ≈ 감은 눈으로 보임)
+PERCLOS_MIN_SAMPLES = 25    # PERCLOS 창에 판정 가능 샘플이 이보다 적으면 중립(0.5)
+BLINK_MIN_SAMPLES = 10      # 세그먼트에 판정 가능 샘플이 이보다 적으면 깜빡임 중립(0.5)

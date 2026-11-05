@@ -18,7 +18,7 @@ CSV_COLUMNS = [
     "final", "personalized", "personal_stability",
     "usage_ratio", "sleepy_flag", "blink_rate_proxy", "perclos_ratio", "EAR_baseline",
     "seat_departed", "head_pose", "head_yaw_dev", "head_up_dev", "head_down_dev", "status", "face_missing_ratio",
-    "body_visible_ratio", "body_width_rel"
+    "body_visible_ratio", "body_width_rel", "eye_eval_ratio"
 ]
 
 def score_landmarks(lm, target_fps=TARGET_FPS, segment_sec=SEGMENT_SEC,
@@ -66,7 +66,8 @@ def segments_to_dataframe(personalized_segments):
             "status": flg["status"],
             "face_missing_ratio": raw["face_missing_ratio"],
             "body_visible_ratio": raw["body_visible_ratio"],
-            "body_width_rel": raw["body_width_rel"]
+            "body_width_rel": raw["body_width_rel"],
+            "eye_eval_ratio": raw["eye_eval_ratio"],
         })
     return pd.DataFrame(rows, columns=CSV_COLUMNS).round(3)
 

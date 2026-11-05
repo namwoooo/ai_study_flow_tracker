@@ -9,13 +9,13 @@ def _eye(x0, d, y=200):
                      [x0+30, y], [x0+20, y+d], [x0+10, y+d]], dtype=np.float32)
 
 
-def _run(closed_idx, n=75, d_open=4.5, d_closed=0.75):
+def _run(closed_idx, n=75, d_open=4.5, d_closed=0.75, head_pose=None):
     eyes = [(_eye(250, d_closed if t in closed_idx else d_open),
              _eye(330, d_closed if t in closed_idx else d_open)) for t in range(n)]
     return compute_segment_scores_7features(
         processed_frames=[True] * n, pose_keypoints=[None] * n, eyes_landmarks=eyes,
         face_bboxes=[(200, 100, 400, 350)] * n, frame_sizes=[(640, 480)] * n,
-        segment_size=25, fps=5,
+        segment_size=25, fps=5, head_pose=head_pose,
     )
 
 
@@ -130,3 +130,11 @@ def test_face_hidden_vs_absent():
         face_bboxes=[(200, 100, 400, 350)] * n, frame_sizes=sizes, segment_size=25, fps=5,
     )
     assert [r["flags"]["status"] for r in res] == ["present", "face_hidden", "absent"]
+
+
+def test_looking_down_not_counted_as_closure():
+    closed = set(range(30, 45))                       # seg1에서 3초간 "감김"처럼 보임
+    hp = [(15.0, 0.0, 0.0) if t in closed else (0.0, 0.0, 0.0) for t in range(75)]
+    res = _run(closed, head_pose=hp)                  # 그 3초 동안 15° 숙임 → 아래 응시
+    assert [r["raw"]["sleepy_flag"] for r in res] == [0, 0, 0]
+    assert all(r["raw"]["perclos_ratio"] == 0.0 for r in res)
