@@ -95,3 +95,19 @@ def weighted_mean(values, weights):
     if total <= 0:
         raise ValueError("가중치 합이 0 이하")
     return sum(weights[k] * values[k] for k in weights) / total
+
+
+def matrix_to_euler_deg(m):
+    """
+    FaceLandmarker 4x4 변환 행렬 → (pitch, yaw, roll) 도(degree)
+
+    회전 순서 R = Rz(roll) @ Ry(yaw) @ Rx(pitch) 기준
+    행렬에 스케일이 섞여 있을 수 있어 열 단위로 정규화
+    부호 방향(왼쪽/오른쪽, 위/아래)은 실제 영상으로 확인
+    """
+    R = np.asarray(m, dtype=np.float64)[:3, :3]
+    R = R / np.linalg.norm(R, axis=0, keepdims=True)
+    pitch = np.arctan2(R[2, 1], R[2, 2])
+    yaw = np.arctan2(-R[2, 0], np.hypot(R[2, 1], R[2, 2]))
+    roll = np.arctan2(R[1, 0], R[0, 0])
+    return tuple(float(v) for v in np.degrees([pitch, yaw, roll]))

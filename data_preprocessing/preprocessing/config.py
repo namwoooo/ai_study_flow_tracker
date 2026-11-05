@@ -34,6 +34,14 @@ DEFAULT_SCORING_PARAMS = {
     "seat_departure_penalty": 0.0,
 }
 
+# FaceLandmarker blendshapes 중 저장할 항목 (하품, 눈만 돌리는 시선 이탈, 깜빡이 보조)
+BLENDSHAPE_KEYS = (
+    "jawOpen",
+    "eyeBlinkLeft", "eyeBlinkRight",
+    "eyeLookInLeft", "eyeLookOutLeft", "eyeLookUpLeft", "eyeLookDownLeft",
+    "eyeLookInRight", "eyeLookOutRight", "eyeLookUpRight", "eyeLookDownRight",
+)
+
 PHONE_USE_THRESH = 25.0         # 손-폰 거리 임계값(px)
 
 # 자리 이탈 기준점 자동 설정

@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 from data_preprocessing.preprocessing.scoring import compute_segment_scores_7features
-from data_preprocessing.preprocessing.features import POSE_IDX
+from data_preprocessing.preprocessing.features import POSE_IDX, matrix_to_euler_deg
+
 
 def _eye(x0, d, y=200):
     return np.array([[x0, y], [x0+10, y-d], [x0+20, y-d],
@@ -68,3 +69,18 @@ def test_hand_face_absent_and_near():
     )
     assert [r["scores"]["hand_face"] for r in res] == [1.0, 0.0]
     assert [r["raw"]["hand_visible_ratio"] for r in res] == [0.0, 1.0]
+
+
+def _mat(pitch=0.0, yaw=0.0, roll=0.0, scale=1.7):
+    p, y, r = np.radians([pitch, yaw, roll])
+    Rx = np.array([[1, 0, 0], [0, np.cos(p), -np.sin(p)], [0, np.sin(p), np.cos(p)]])
+    Ry = np.array([[np.cos(y), 0, np.sin(y)], [0, 1, 0], [-np.sin(y), 0, np.cos(y)]])
+    Rz = np.array([[np.cos(r), -np.sin(r), 0], [np.sin(r), np.cos(r), 0], [0, 0, 1]])
+    M = np.eye(4)
+    M[:3, :3] = (Rz @ Ry @ Rx) * scale
+    return M
+
+
+@pytest.mark.parametrize("pitch,yaw,roll", [(0, 0, 0), (15, 0, 0), (0, -25, 0), (0, 0, 10), (-10, 20, 5)])
+def test_matrix_to_euler_deg(pitch, yaw, roll):
+    assert matrix_to_euler_deg(_mat(pitch, yaw, roll)) == pytest.approx((pitch, yaw, roll), abs=1e-6)

@@ -7,8 +7,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from .config import FACE_MODEL_PATH, POSE_MODEL_PATH, TARGET_FPS
-from .features import LEFT_EYE_IDXS, RIGHT_EYE_IDXS
+from .config import FACE_MODEL_PATH, POSE_MODEL_PATH, TARGET_FPS, BLENDSHAPE_KEYS
+from .features import LEFT_EYE_IDXS, RIGHT_EYE_IDXS, matrix_to_euler_deg
 
 BaseOptions = mp.tasks.BaseOptions
 FaceLandmarker = mp.tasks.vision.FaceLandmarker
@@ -17,14 +17,16 @@ FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
 PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
 VisionRunningMode = mp.tasks.vision.RunningMode
 
-FRAME_KEYS = ("processed_frames", "face_bboxes", "frame_sizes", "eyes_landmarks", "pose_keypoints")
-
+FRAME_KEYS = ("processed_frames", "face_bboxes", "frame_sizes", "eyes_landmarks",
+              "pose_keypoints", "head_pose", "blendshapes")
 
 def _build_options(face_model_path, pose_model_path):
     face_opts = FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=face_model_path),
         running_mode=VisionRunningMode.VIDEO,
         num_faces=1,
+        output_face_blendshapes=True,
+        output_facial_transformation_matrixes=True,
     )
     pose_opts = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=pose_model_path),
@@ -74,6 +76,16 @@ def _process_sampled_frame(frame_bgr, timestamp_ms, mp_face, mp_pose, frames, ti
     frames["face_bboxes"].append((xmin, ymin, xmax, ymax))
     frames["frame_sizes"].append((w, h))
     frames["processed_frames"].append(True)
+
+    # --- Head pose / Blendshapes ---
+    mats = res_face.facial_transformation_matrixes
+    frames["head_pose"].append(matrix_to_euler_deg(mats[0]) if mats else None)
+
+    bss = res_face.face_blendshapes
+    frames["blendshapes"].append(
+        {c.category_name: round(c.score, 4) for c in bss[0] if c.category_name in BLENDSHAPE_KEYS}
+        if bss else None
+    )
 
     # --- Eyes ---
     lm_np = np.array([[p.x * w, p.y * h] for p in lm], dtype=np.float32)
