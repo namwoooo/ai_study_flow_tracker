@@ -20,6 +20,18 @@ CSV_COLUMNS = [
     "seat_departed",
 ]
 
+def score_landmarks(lm, target_fps=TARGET_FPS, segment_sec=SEGMENT_SEC,
+                    warmup_segments=WARMUP_SEGMENTS, phone_bboxes=None, debug=False):
+    """추출 결과(lm) → (df, baseline, seg_results) / 추출 없이 점수만 다시 계산할 때 사용"""
+    seg_results = compute_segment_scores_7features(
+        processed_frames=lm["processed_frames"], pose_keypoints=lm["pose_keypoints"],
+        eyes_landmarks=lm["eyes_landmarks"], face_bboxes=lm["face_bboxes"],
+        frame_sizes=lm["frame_sizes"], segment_size=target_fps * segment_sec,
+        phone_bboxes=phone_bboxes, fps=target_fps, debug=debug,
+    )
+    baseline = compute_personal_baseline_stability_filtered(seg_results, warmup_segments)
+    df = segments_to_dataframe(apply_personalization_with_delta(seg_results, baseline))
+    return df, baseline, seg_results
 
 def segments_to_dataframe(personalized_segments):
     """개인화된 세그먼트 결과 → 라벨 CSV와 동일한 구조의 DataFrame."""
@@ -66,31 +78,15 @@ def run(
         info (dict): num_frames, num_segments, native_fps, timing{extract, face, pose, skip, scoring, total}
     """
     t_start = time.time()
-    segment_size = target_fps * segment_sec
 
     # 1) 랜드마크 추출
     lm = extract_landmarks(video_path, target_fps, face_model_path, pose_model_path)
 
     # 2) 세그먼트 점수
     t1 = time.time()
-    seg_results = compute_segment_scores_7features(
-        processed_frames=lm["processed_frames"],
-        pose_keypoints=lm["pose_keypoints"],
-        eyes_landmarks=lm["eyes_landmarks"],
-        face_bboxes=lm["face_bboxes"],
-        frame_sizes=lm["frame_sizes"],
-        segment_size=segment_size,
-        phone_bboxes=phone_bboxes,
-        debug=debug,
-        fps=target_fps
-    )
+    df, baseline, seg_results = score_landmarks(
+        lm, target_fps, segment_sec, warmup_segments, phone_bboxes, debug)
     t_scoring = time.time() - t1
-
-    # 3) 개인화
-    baseline = compute_personal_baseline_stability_filtered(seg_results, warmup_segments)
-    personalized = apply_personalization_with_delta(seg_results, baseline)
-
-    df = segments_to_dataframe(personalized)
 
     info = {
         "num_frames": lm["num_frames"],
