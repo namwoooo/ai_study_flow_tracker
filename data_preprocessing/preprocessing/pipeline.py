@@ -32,41 +32,16 @@ def score_landmarks(lm, target_fps=TARGET_FPS, segment_sec=SEGMENT_SEC, phone_bb
     return df, baseline, seg_results
 
 def segments_to_dataframe(personalized_segments):
-    """개인화된 세그먼트 결과 → 라벨 CSV와 동일한 구조의 DataFrame."""
-    rows = []
-    for r in personalized_segments:
-        s, raw, flg = r["scores"], r["raw"], r["flags"]
-        rows.append({
-            "segment_idx": r["segment_idx"],
-            "phone_use": s["phone_use"],
-            "seat_depart": s["seat_depart"],
-            "head_angle": s["head_angle"],
-            "shoulder_tilt": s["shoulder_tilt"],
-            "hand_face": s["hand_face"],
-            "hand_visible_ratio": raw["hand_visible_ratio"],
-            "blink": s["blink"],
-            "perclos": s["perclos"],
-            "perclos_ratio": raw["perclos_ratio"],
-            "final": s["final"],
-            "personalized": s["personalized"],
-            "personal_stability": s["personal_stability"],
-            "usage_ratio": raw["usage_ratio"],
-            "sleepy_flag": raw["sleepy_flag"],
-            "blink_rate_proxy": raw["blink_rate_proxy"],
-            "EAR_baseline": raw["EAR_baseline"],
-            "seat_departed": flg["seat_departed"],
-            "head_pose": s["head_pose"],
-            "head_yaw_dev": raw["head_yaw_dev"],
-            "head_up_dev": raw["head_up_dev"],
-            "head_down_dev": raw["head_down_dev"],
-            "status": flg["status"],
-            "face_missing_ratio": raw["face_missing_ratio"],
-            "body_visible_ratio": raw["body_visible_ratio"],
-            "body_width_rel": raw["body_width_rel"],
-            "eye_eval_ratio": raw["eye_eval_ratio"],
-            "present_ratio": raw["present_ratio"]
-        })
-    return pd.DataFrame(rows, columns=CSV_COLUMNS).round(3)
+    """개인화된 세그먼트 결과 → CSV_COLUMNS 순서의 DataFrame
+
+    scores / raw / flags를 펼쳐 한 행으로 만든다. 새 값을 CSV에 넣으려면
+    scoring 결과에 추가하고 CSV_COLUMNS에 이름만 넣으면 된다.
+    """
+    rows = [
+        {"segment_idx": r["segment_idx"], **r["scores"], **r["raw"], **r["flags"]}
+        for r in personalized_segments
+    ]
+    return pd.DataFrame(rows).reindex(columns=CSV_COLUMNS)
 
 
 def _episodes(mask):
