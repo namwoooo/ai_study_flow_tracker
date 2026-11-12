@@ -317,6 +317,11 @@ def compute_segment_scores_7features(
         seg_sw_med = _nanmedian(seg_sw)
         body_width_rel = seg_sw_med / ref_sw if np.isfinite(seg_sw_med) and np.isfinite(ref_sw) else float("nan")
 
+        # 샘플 단위 재석 여부: 얼굴이 보이거나, 책상 앞 몸이 보이면 자리에 있음
+        face_ok_seg = np.array([frame_sizes[t] is not None for t in range(s, e)])
+        present_ratio = float((face_ok_seg | body_ok).mean())
+        feature_scores["seat_depart"] = present_ratio   # 세그먼트 일부만 비워도 그만큼 감점
+
         if face_missing_ratio < ABSENT_FACE_MISSING_RATIO:
             status = "present"
         elif body_visible_ratio >= BODY_VISIBLE_RATIO:
@@ -329,7 +334,8 @@ def compute_segment_scores_7features(
             feature_scores = {k: float("nan") for k in feature_scores}
             final_score = float("nan")
         else:
-            final_score = weighted_mean(feature_scores, W)
+            # 세그먼트 일부를 비웠으면 그 비율만큼 감점 (계속 앉아 있으면 1.0이라 영향 없음)
+            final_score = weighted_mean(feature_scores, W) * present_ratio
 
         results.append({
             "segment_idx": seg_idx,
@@ -351,6 +357,7 @@ def compute_segment_scores_7features(
                 "face_missing_ratio": round(face_missing_ratio, 4),
                 "body_visible_ratio": round(body_visible_ratio, 4),
                 "body_width_rel": round(body_width_rel, 3),
+                "present_ratio": round(present_ratio, 4),
             },
             "flags": {
                 "seat_departed": status == "absent",

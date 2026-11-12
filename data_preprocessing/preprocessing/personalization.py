@@ -84,6 +84,7 @@ def apply_personalization(segment_results, segment_sec=SEGMENT_SEC):
                     stability = float(np.exp(-z_mean))
                     if seg["raw"].get("sleepy_flag") == 1:
                         stability *= SLEEPY_PENALTY
+                    stability *= seg["raw"].get("present_ratio", 1.0)   # 부분 이탈 반영
                     personalized = FINAL_MIX_WEIGHT * scores["final"] + STABILITY_MIX_WEIGHT * stability
                 else:
                     personalized, stability = scores["final"], NAN
