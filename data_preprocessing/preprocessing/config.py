@@ -109,3 +109,19 @@ HAND_ABSENT_SCORE = 1.0  # 손목이 화면에 없을 때 (책상 위로 간주)
 EYE_GATE_DOWN_DEG = 5.0     # 기준 자세보다 이 이상 숙이면 눈 판정 불가 (아래 응시 ≈ 감은 눈으로 보임)
 PERCLOS_MIN_SAMPLES = 25    # PERCLOS 창에 판정 가능 샘플이 이보다 적으면 중립(0.5)
 BLINK_MIN_SAMPLES = 10      # 세그먼트에 판정 가능 샘플이 이보다 적으면 깜빡임 중립(0.5)
+
+# 개인화: 직전 10분 present 세그먼트 대비 나빠진 방향 변화만 감점
+PERSONAL_WINDOW_SEC = 600
+PERSONAL_MIN_SEGMENTS = 12   # 기준 구간에 present 세그먼트가 이보다 적으면(시작 후 약 1분) final 그대로 사용
+
+# source: scores(0~1 점수, 낮을수록 나쁨) 또는 raw(원시값)
+# floor: 스케일 하한 -> 평소 값이 거의 일정한 피처가 작은 변화에 과민 반응하지 않도록
+# 가중치는 합으로 정규화되므로 합이 1일 필요 없음
+PERSONAL_FEATURES = {
+    "perclos":    {"source": "raw",    "key": "perclos_ratio",    "higher_is_worse": True,  "floor": 0.05, "weight": 0.25},
+    "blink":      {"source": "raw",    "key": "blink_rate_proxy", "higher_is_worse": True,  "floor": 0.03, "weight": 0.15},
+    "head_pose":  {"source": "scores", "key": "head_pose",        "higher_is_worse": False, "floor": 0.15, "weight": 0.25},
+    "head_angle": {"source": "scores", "key": "head_angle",       "higher_is_worse": False, "floor": 0.15, "weight": 0.10},
+    "shoulder":   {"source": "scores", "key": "shoulder_tilt",    "higher_is_worse": False, "floor": 0.15, "weight": 0.10},
+    "hand":       {"source": "scores", "key": "hand_face",        "higher_is_worse": False, "floor": 0.15, "weight": 0.15},
+}

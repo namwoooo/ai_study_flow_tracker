@@ -4,12 +4,9 @@ import time
 
 import pandas as pd
 
-from .config import FACE_MODEL_PATH, POSE_MODEL_PATH, SEGMENT_SEC, TARGET_FPS, WARMUP_SEGMENTS
+from .config import FACE_MODEL_PATH, POSE_MODEL_PATH, SEGMENT_SEC, TARGET_FPS
+from .personalization import apply_personalization
 from .extraction import extract_landmarks
-from .personalization import (
-    apply_personalization_with_delta,
-    compute_personal_baseline_stability_filtered,
-)
 from .scoring import compute_segment_scores_7features
 
 CSV_COLUMNS = [
@@ -21,8 +18,7 @@ CSV_COLUMNS = [
     "body_visible_ratio", "body_width_rel", "eye_eval_ratio"
 ]
 
-def score_landmarks(lm, target_fps=TARGET_FPS, segment_sec=SEGMENT_SEC,
-                    warmup_segments=WARMUP_SEGMENTS, phone_bboxes=None, debug=False):
+def score_landmarks(lm, target_fps=TARGET_FPS, segment_sec=SEGMENT_SEC, phone_bboxes=None, debug=False):
     """추출 결과(lm) → (df, baseline, seg_results) / 추출 없이 점수만 다시 계산할 때 사용"""
     seg_results = compute_segment_scores_7features(
         processed_frames=lm["processed_frames"], pose_keypoints=lm["pose_keypoints"],
@@ -30,9 +26,9 @@ def score_landmarks(lm, target_fps=TARGET_FPS, segment_sec=SEGMENT_SEC,
         frame_sizes=lm["frame_sizes"], segment_size=target_fps * segment_sec,
         head_pose=lm.get("head_pose"),
         phone_bboxes=phone_bboxes, fps=target_fps, debug=debug,
-    )
-    baseline = compute_personal_baseline_stability_filtered(seg_results, warmup_segments)
-    df = segments_to_dataframe(apply_personalization_with_delta(seg_results, baseline))
+    )   # 기존 그대로
+    personalized, baseline = apply_personalization(seg_results, segment_sec)
+    df = segments_to_dataframe(personalized)
     return df, baseline, seg_results
 
 def segments_to_dataframe(personalized_segments):
@@ -110,7 +106,6 @@ def run(
         segment_sec=SEGMENT_SEC,
         face_model_path=FACE_MODEL_PATH,
         pose_model_path=POSE_MODEL_PATH,
-        warmup_segments=WARMUP_SEGMENTS,
         phone_bboxes=None,
         debug=False,
 ):
@@ -128,8 +123,7 @@ def run(
     # 2) 세그먼트 점수
     t1 = time.time()
     df, baseline, seg_results = score_landmarks(
-        lm, target_fps=target_fps, segment_sec=segment_sec,
-        warmup_segments=warmup_segments, phone_bboxes=phone_bboxes, debug=debug,
+        lm, target_fps=target_fps, segment_sec=segment_sec,phone_bboxes=phone_bboxes, debug=debug,
     )
     t_scoring = time.time() - t1
 

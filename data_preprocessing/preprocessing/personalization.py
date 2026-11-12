@@ -1,128 +1,97 @@
-"""안정 구간 기반 개인화 baseline 계산 및 적용"""
+"""개인 기준(직전 구간) 대비 변화로 개인화 점수를 계산
+
+- 기준 구간: 현재 세그먼트 **이전**의 최근 PERSONAL_WINDOW_SEC 동안 present 세그먼트
+  (과거 데이터만 사용 → 실시간 계산 가능, 영상 길이와 무관하게 동작)
+- 피처별 기준값 = 중앙값, 스케일 = max(1.4826 × MAD, 피처별 하한)
+  (중앙값·MAD는 기준 구간에 딴짓이 절반 미만 섞여도 흔들리지 않음)
+- 평소보다 **나빠진 방향**의 이탈만 감점: z = max(0, 이탈 / 스케일), stability = exp(-z)
+- personalized = FINAL_MIX_WEIGHT × final + STABILITY_MIX_WEIGHT × stability
+"""
 
 import numpy as np
 
 from .config import (
-    BASELINE_DEFAULT_MEANS,
     FINAL_MIX_WEIGHT,
+    PERSONAL_FEATURES,
+    PERSONAL_MIN_SEGMENTS,
+    PERSONAL_WINDOW_SEC,
+    SEGMENT_SEC,
     SLEEPY_PENALTY,
-    STABILITY_FILTER,
     STABILITY_MIX_WEIGHT,
-    STABILITY_WEIGHTS,
-    WARMUP_SEGMENTS,
 )
 
-from .features import weighted_mean
+NAN = float("nan")
 
 
-def _safe_stats(arr, default_mean):
-    if len(arr) == 0:
-        return default_mean, 1e-4
-    arr = np.array(arr, dtype=np.float32)
-    return float(arr.mean()), float(arr.std() + 1e-4)
+def _value(seg, source, key):
+    v = seg[source].get(key)
+    return float(v) if v is not None else NAN
 
 
-def _stability(x, mu, sigma):
-    """z = |x - μ| / σ, stability = exp(-z). baseline에서 멀수록 빠르게 감점."""
-    z = abs(x - mu) / sigma
-    return float(np.exp(-z))
+def _robust_stats(vals, floor):
+    """(중앙값, 스케일). 스케일은 1.4826 × MAD(정규분포에서 표준편차와 같아지는 보정)와 하한 중 큰 값."""
+    vals = vals[np.isfinite(vals)]
+    if len(vals) == 0:
+        return NAN, NAN
+    med = float(np.median(vals))
+    mad = float(np.median(np.abs(vals - med)))
+    return med, max(1.4826 * mad, floor)
 
 
-def _is_stable(seg):
-    """baseline 계산에 쓸 안정 구간인지 판정."""
-    sc, raw, flg = seg["scores"], seg["raw"], seg["flags"]
-    f = STABILITY_FILTER
+def apply_personalization(segment_results, segment_sec=SEGMENT_SEC):
+    """세그먼트 결과에 personalized, personal_stability를 추가한다.
 
-    if flg["status"] != "present":                           # 자리 이탈
-        return False
-    if raw["blink_rate_proxy"] > f["blink_rate_max"]:  # blink spike
-        return False
-    if raw["sleepy_flag"] == 1:                        # 졸음
-        return False
-    if sc["hand_face"] < f["hand_face_min"]:           # 손-얼굴 과근접 (폰 사용 의심)
-        return False
-    if sc["phone_use"] < f["phone_use_min"]:           # 폰 사용
-        return False
-    if sc["head_angle"] < f["head_angle_min"]:         # 고개 과도 기울어짐
-        return False
-    if sc["shoulder_tilt"] < f["shoulder_tilt_min"]:   # 어깨 틀어짐
-        return False
-    return True
-
-
-def compute_personal_baseline_stability_filtered(segment_results, warmup_segments=WARMUP_SEGMENTS):
-    """초기 warmup 구간 중 안정적 집중 상태인 세그먼트만으로 개인 baseline 구축."""
-    warm = segment_results[:min(warmup_segments, len(segment_results))]
-
-    head_vals, shoulder_vals, hand_face_vals, blink_vals, phone_vals = [], [], [], [], []
-
-    for seg in warm:
-        if not _is_stable(seg):
-            continue
-        sc, raw = seg["scores"], seg["raw"]
-        head_vals.append(sc["head_angle"])
-        shoulder_vals.append(sc["shoulder_tilt"])
-        hand_face_vals.append(sc["hand_face"])
-        blink_vals.append(raw["blink_rate_proxy"])
-        phone_vals.append(sc["phone_use"])
-
-    d = BASELINE_DEFAULT_MEANS
-    head_mean, head_std = _safe_stats(head_vals, d["head"])
-    shoulder_mean, shoulder_std = _safe_stats(shoulder_vals, d["shoulder"])
-    hand_mean, hand_std = _safe_stats(hand_face_vals, d["hand"])
-    blink_mean, blink_std = _safe_stats(blink_vals, d["blink"])
-    phone_mean, phone_std = _safe_stats(phone_vals, d["phone"])
-
-    return {
-        "head_mean": head_mean,         "head_std": head_std,
-        "shoulder_mean": shoulder_mean, "shoulder_std": shoulder_std,
-        "hand_mean": hand_mean,         "hand_std": hand_std,
-        "blink_mean": blink_mean,       "blink_std": blink_std,
-        "phone_mean": phone_mean,       "phone_std": phone_std,
-        "num_stable_segments": len(head_vals),
-    }
-
-
-def apply_personalization_with_delta(segment_results, baseline):
-    """baseline 대비 변화량으로 개인화 점수 계산.
-
-    personalized = 0.6 * final + 0.4 * personal_stability
+    Returns:
+        personalized (list[dict]): 입력 세그먼트에 scores.personalized / personal_stability 추가
+        summary (dict): 마지막 present 세그먼트 시점의 개인 기준값 (리포트·디버깅용)
     """
-    b = baseline
-    sw = STABILITY_WEIGHTS
-    personalized = []
+    window = max(1, int(round(PERSONAL_WINDOW_SEC / segment_sec)))
+    vals = {
+        name: np.array([_value(s, cfg["source"], cfg["key"]) for s in segment_results])
+        for name, cfg in PERSONAL_FEATURES.items()
+    }
+    present = np.array([s["flags"]["status"] == "present" for s in segment_results])
 
-    for seg in segment_results:
-        sc, raw, flg = seg["scores"], seg["raw"], seg["flags"]
+    out = []
+    summary = {"num_stable_segments": 0, "features": {}}
 
-        if flg["status"] != "present":
-            seg_new = seg.copy()
-            seg_new["scores"] = {**seg["scores"], "personalized": float("nan"),
-                                 "personal_stability": float("nan")}
-            personalized.append(seg_new)
-            continue
+    for i, seg in enumerate(segment_results):
+        scores = dict(seg["scores"])
+        ref_idx = [j for j in range(max(0, i - window), i) if present[j]]   # 과거만
 
-        st_head = _stability(sc["head_angle"], b["head_mean"], b["head_std"])
-        st_shoul = _stability(sc["shoulder_tilt"], b["shoulder_mean"], b["shoulder_std"])
-        st_hand = _stability(sc["hand_face"], b["hand_mean"], b["hand_std"])
-        st_blink = _stability(raw["blink_rate_proxy"], b["blink_mean"], b["blink_std"])
-        st_phone = _stability(sc["phone_use"], b["phone_mean"], b["phone_std"])
+        if not present[i]:
+            personalized, stability = NAN, NAN
+        elif len(ref_idx) < PERSONAL_MIN_SEGMENTS:
+            # 기준이 쌓이는 중(시작 후 약 1분): 개인화 없이 final 사용
+            personalized, stability = scores["final"], NAN
+        else:
+            st, wts, ref_stats = {}, {}, {}
+            for name, cfg in PERSONAL_FEATURES.items():
+                x = vals[name][i]
+                med, scale = _robust_stats(vals[name][ref_idx], cfg["floor"])
+                ref_stats[name] = (med, scale)
+                if not (np.isfinite(x) and np.isfinite(med)):
+                    continue   # 이 세그먼트에서 측정 불가한 피처는 제외하고 남은 가중치로 정규화
+                worse = (x - med) if cfg["higher_is_worse"] else (med - x)
+                st[name] = float(np.exp(-max(0.0, worse / scale)))
+                wts[name] = cfg["weight"]
 
-        personal_stability = weighted_mean(
-            {"head": st_head, "shoulder": st_shoul, "hand": st_hand,
-             "blink": st_blink, "phone": st_phone},
-            STABILITY_WEIGHTS,
-        )
+            if wts:
+                stability = sum(wts[n] * st[n] for n in wts) / sum(wts.values())
+                if seg["raw"].get("sleepy_flag") == 1:
+                    stability *= SLEEPY_PENALTY
+                personalized = FINAL_MIX_WEIGHT * scores["final"] + STABILITY_MIX_WEIGHT * stability
+            else:
+                personalized, stability = scores["final"], NAN
 
-        if raw["sleepy_flag"] == 1:
-            personal_stability *= SLEEPY_PENALTY
+            summary = {
+                "num_stable_segments": len(ref_idx),
+                "features": {n: {"median": round(m, 4), "scale": round(sc, 4)}
+                             for n, (m, sc) in ref_stats.items() if np.isfinite(m)},
+            }
 
-        final_personal = FINAL_MIX_WEIGHT * sc["final"] + STABILITY_MIX_WEIGHT * personal_stability
+        scores["personalized"] = round(float(personalized), 4)
+        scores["personal_stability"] = round(float(stability), 4)
+        out.append({**seg, "scores": scores})
 
-        seg_new = seg.copy()
-        seg_new["scores"] = seg["scores"].copy()
-        seg_new["scores"]["personalized"] = round(final_personal, 4)
-        seg_new["scores"]["personal_stability"] = round(personal_stability, 4)
-        personalized.append(seg_new)
-
-    return personalized
+    return out, summary
