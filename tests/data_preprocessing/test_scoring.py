@@ -2,7 +2,7 @@ import numpy as np
 import math
 import pytest
 from data_preprocessing.preprocessing.scoring import compute_segment_scores_7features
-from data_preprocessing.preprocessing.features import POSE_IDX, matrix_to_euler_deg
+from data_preprocessing.preprocessing.features import POSE_IDX, matrix_to_euler_deg, gaze_h_series, rolling_past_median
 from data_preprocessing.preprocessing.personalization import apply_personalization
 
 
@@ -178,3 +178,22 @@ def test_single_strong_deviation_not_diluted():
     hand_drop["scores"]["hand_face"] = 0.2          # 다른 피처는 모두 평소와 같음
     out, _ = apply_personalization(base + [hand_drop])
     assert out[-1]["scores"]["personal_stability"] < 0.6
+
+
+
+def _bs(in_l=0.0, out_l=0.0, in_r=0.0, out_r=0.0):
+    return {"eyeLookInLeft": in_l, "eyeLookOutLeft": out_l,
+            "eyeLookInRight": in_r, "eyeLookOutRight": out_r}
+
+
+def test_gaze_h_sign_and_missing():
+    g = gaze_h_series([_bs(out_l=0.6, in_r=0.6), _bs(in_l=0.6, out_r=0.6), None])
+    assert g[0] > 0 > g[1]
+    assert np.isnan(g[2])
+
+
+def test_rolling_past_median_excludes_current():
+    x = np.array([0.0] * 10 + [1.0])
+    r = rolling_past_median(x, window=10, min_periods=5)
+    assert r[-1] == 0.0          # 현재 샘플(1.0)은 기준에 들어가지 않음
+    assert np.isnan(r[3])        # min_periods 미만

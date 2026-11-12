@@ -34,6 +34,8 @@ from .features import (
     shoulder_width,
     to_score,
     weighted_mean,
+    gaze_h_series,
+    rolling_past_median,
 )
 
 
@@ -82,6 +84,7 @@ def compute_segment_scores_7features(
         params=None,
         fps=TARGET_FPS,
         head_pose=None,
+        blendshapes=None,
         debug=False,
 ):
     T = len(processed_frames)
@@ -136,6 +139,14 @@ def compute_segment_scores_7features(
     # --- 몸 크기 기준: 얼굴이 보인 샘플의 어깨 폭 (멀리 있는 사람·물체와 책상 앞 사람 구분용) ---
     sw_s = np.array([shoulder_width(p) for p in pose_keypoints], dtype=float)
     face_ok = np.array([fs is not None for fs in frame_sizes])
+
+    # 수평 시선: 직전 10분 중앙값 대비 이탈 (head pose 기준 자세와 같은 창)
+    if blendshapes is not None:
+        gaze_h = gaze_h_series(blendshapes)
+        gaze_ref = rolling_past_median(gaze_h, window=int(HEAD_REF_WINDOW_SEC * fps), min_periods=int(30 * fps))
+        gaze_dev = np.abs(gaze_h - gaze_ref)
+    else:
+        gaze_dev = np.full(len(frame_sizes), np.nan)
 
     # ------------------------------------------------------------------
     # 세그먼트 루프
@@ -292,6 +303,15 @@ def compute_segment_scores_7features(
             perclos_ratio = float("nan")
             perclos_score = 0.5
 
+        # 시선 이탈 비율: 세그먼트 중 다른 곳을 본 샘플 비율
+        gd = gaze_dev[s:e]
+        gd = gd[np.isfinite(gd)]
+        if len(gd) >= 5:
+            gaze_away_ratio = float((gd > P["gaze_dev_thresh"]).mean())
+            gaze_score = to_score(gaze_away_ratio, *P["norm"]["gaze_away_ratio"], small_is_good=True)
+        else:
+            gaze_away_ratio, gaze_score = float("nan"), 0.5   # 샘플 부족 시 중립 (기존 규칙과 동일)
+
         feature_scores = {
             "phone_use": phone_use_score,
             "seat_depart": seat_depart_score,
@@ -301,6 +321,7 @@ def compute_segment_scores_7features(
             "blink": blink_score,
             "perclos": perclos_score,
             "head_pose": head_pose_score,
+            "gaze": gaze_score,
         }
 
         # 상태 판정: 얼굴이 대부분 없으면, 책상 앞 몸(양 어깨, 평소 폭)이 보이는지로 구분
@@ -358,6 +379,7 @@ def compute_segment_scores_7features(
                 "body_visible_ratio": round(body_visible_ratio, 4),
                 "body_width_rel": round(body_width_rel, 3),
                 "present_ratio": round(present_ratio, 4),
+                "gaze_away_ratio": round(gaze_away_ratio, 4),
             },
             "flags": {
                 "seat_departed": status == "absent",

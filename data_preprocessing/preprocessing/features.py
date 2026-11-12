@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 
 from .config import EAR_BASELINE_DEFAULT, EAR_BASELINE_MIN_SAMPLES, EYE_CLOSURE_RATIO, POSE_VIS_THRESH
 
@@ -17,6 +18,21 @@ POSE_IDX = {
 }
 
 POSE_STRIDE = 4  # x, y, z, visibility
+
+def gaze_h_series(blendshapes):
+    """샘플별 수평 시선. 한쪽 방향 응시 시 양 눈의 In/Out이 반대로 움직이는 것을 합친 값.
+    얼굴 미검출 샘플은 NaN."""
+    out = np.full(len(blendshapes), np.nan)
+    for i, b in enumerate(blendshapes):
+        if b is None:
+            continue
+        out[i] = ((b["eyeLookOutLeft"] + b["eyeLookInRight"]) / 2
+                  - (b["eyeLookInLeft"] + b["eyeLookOutRight"]) / 2)
+    return out
+
+def rolling_past_median(x, window, min_periods):
+    """각 시점 **이전** window 샘플의 중앙값 (현재 샘플 제외 → 실시간 계산 가능). NaN은 건너뜀."""
+    return pd.Series(x).rolling(window, min_periods=min_periods).median().shift(1).to_numpy()
 
 
 # 기하 / 정규화

@@ -22,6 +22,7 @@ DEFAULT_SCORING_PARAMS = {
         "perclos":          (0.05, 0.25),   # 평상시 -0.05, 졸음 경계 -0.15
         "head_yaw_deg":     (6.0, 15.0),   # focus 세그먼트 p90 ≈ 6°, away_speaking p50 ≈ 10~12°
         "head_up_deg":      (4.0, 20.0),   # focus p90 ≈ 4°, look_up p50 ≈ 23~26°
+        "gaze_away_ratio":  (0.15, 0.50),  # focus p90 ≈ 0.16, away_left p50 ≈ 0.48 (thr 0.20 기준)
     },
     # 가중치는 합으로 정규화되므로 합이 1일 필요 없음
     "w": {
@@ -33,8 +34,10 @@ DEFAULT_SCORING_PARAMS = {
         "blink":         0.16,
         "perclos":       0.16,
         "head_pose":     0.16,
+        "gaze":          0.12,
     },
     "seat_departure_penalty": 0.0,
+    "gaze_dev_thresh": 0.20,  # 샘플 단위 수평 시선 이탈 기준
 }
 
 # FaceLandmarker blendshapes 중 저장할 항목 (하품, 눈만 돌리는 시선 이탈, 깜빡이 보조)
@@ -125,4 +128,5 @@ PERSONAL_FEATURES = {
     "head_angle": {"source": "scores", "key": "head_angle",       "higher_is_worse": False, "floor": 0.15, "weight": 0.10},
     "shoulder":   {"source": "scores", "key": "shoulder_tilt",    "higher_is_worse": False, "floor": 0.15, "weight": 0.10},
     "hand":       {"source": "scores", "key": "hand_face",        "higher_is_worse": False, "floor": 0.15, "weight": 0.15},
+    "gaze": {"source": "scores", "key": "gaze", "higher_is_worse": False, "floor": 0.15, "weight": 0.15},
 }

@@ -15,7 +15,7 @@ CSV_COLUMNS = [
     "final", "personalized", "personal_stability",
     "usage_ratio", "sleepy_flag", "blink_rate_proxy", "perclos_ratio", "EAR_baseline",
     "seat_departed", "head_pose", "head_yaw_dev", "head_up_dev", "head_down_dev", "status", "face_missing_ratio",
-    "body_visible_ratio", "body_width_rel", "eye_eval_ratio", "present_ratio"
+    "body_visible_ratio", "body_width_rel", "eye_eval_ratio", "present_ratio", "gaze", "gaze_away_ratio"
 ]
 
 def score_landmarks(lm, target_fps=TARGET_FPS, segment_sec=SEGMENT_SEC, phone_bboxes=None, debug=False):
@@ -25,7 +25,7 @@ def score_landmarks(lm, target_fps=TARGET_FPS, segment_sec=SEGMENT_SEC, phone_bb
         eyes_landmarks=lm["eyes_landmarks"], face_bboxes=lm["face_bboxes"],
         frame_sizes=lm["frame_sizes"], segment_size=target_fps * segment_sec,
         head_pose=lm.get("head_pose"),
-        phone_bboxes=phone_bboxes, fps=target_fps, debug=debug,
+        phone_bboxes=phone_bboxes, fps=target_fps, blendshapes=lm.get("blendshapes"), debug=debug,
     )   # 기존 그대로
     personalized, baseline = apply_personalization(seg_results, segment_sec)
     df = segments_to_dataframe(personalized)
