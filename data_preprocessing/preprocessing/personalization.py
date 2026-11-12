@@ -4,7 +4,7 @@
   (과거 데이터만 사용 → 실시간 계산 가능, 영상 길이와 무관하게 동작)
 - 피처별 기준값 = 중앙값, 스케일 = max(1.4826 × MAD, 피처별 하한)
   (중앙값·MAD는 기준 구간에 딴짓이 절반 미만 섞여도 흔들리지 않음)
-- 평소보다 **나빠진 방향**의 이탈만 감점: z = max(0, 이탈 / 스케일), stability = exp(-z)
+- 평소보다 **나빠진 방향**의 이탈만 감점: z = max(0, 이탈 / 스케일), stability = exp(-가중평균(min(z, Z_MAX)))
 - personalized = FINAL_MIX_WEIGHT × final + STABILITY_MIX_WEIGHT × stability
 """
 
@@ -15,6 +15,7 @@ from .config import (
     PERSONAL_FEATURES,
     PERSONAL_MIN_SEGMENTS,
     PERSONAL_WINDOW_SEC,
+    PERSONAL_Z_MAX,
     SEGMENT_SEC,
     SLEEPY_PENALTY,
     STABILITY_MIX_WEIGHT,
@@ -57,6 +58,7 @@ def apply_personalization(segment_results, segment_sec=SEGMENT_SEC):
 
     for i, seg in enumerate(segment_results):
         scores = dict(seg["scores"])
+        personalized, stability = NAN, NAN
         ref_idx = [j for j in range(max(0, i - window), i) if present[j]]   # 과거만
 
         if not present[i]:
@@ -65,24 +67,26 @@ def apply_personalization(segment_results, segment_sec=SEGMENT_SEC):
             # 기준이 쌓이는 중(시작 후 약 1분): 개인화 없이 final 사용
             personalized, stability = scores["final"], NAN
         else:
-            st, wts, ref_stats = {}, {}, {}
+            zs, wts, ref_stats = {}, {}, {}
             for name, cfg in PERSONAL_FEATURES.items():
                 x = vals[name][i]
                 med, scale = _robust_stats(vals[name][ref_idx], cfg["floor"])
                 ref_stats[name] = (med, scale)
                 if not (np.isfinite(x) and np.isfinite(med)):
-                    continue   # 이 세그먼트에서 측정 불가한 피처는 제외하고 남은 가중치로 정규화
+                    continue
                 worse = (x - med) if cfg["higher_is_worse"] else (med - x)
-                st[name] = float(np.exp(-max(0.0, worse / scale)))
+                zs[name] = min(max(0.0, worse / scale), PERSONAL_Z_MAX)
                 wts[name] = cfg["weight"]
 
-            if wts:
-                stability = sum(wts[n] * st[n] for n in wts) / sum(wts.values())
-                if seg["raw"].get("sleepy_flag") == 1:
-                    stability *= SLEEPY_PENALTY
-                personalized = FINAL_MIX_WEIGHT * scores["final"] + STABILITY_MIX_WEIGHT * stability
-            else:
-                personalized, stability = scores["final"], NAN
+                if wts:
+                    # z를 먼저 평균: 한 피처의 큰 이탈이 다른 피처의 정상값에 희석되지 않도록
+                    z_mean = sum(wts[n] * zs[n] for n in wts) / sum(wts.values())
+                    stability = float(np.exp(-z_mean))
+                    if seg["raw"].get("sleepy_flag") == 1:
+                        stability *= SLEEPY_PENALTY
+                    personalized = FINAL_MIX_WEIGHT * scores["final"] + STABILITY_MIX_WEIGHT * stability
+                else:
+                    personalized, stability = scores["final"], NAN
 
             summary = {
                 "num_stable_segments": len(ref_idx),

@@ -1,7 +1,9 @@
 import numpy as np
+import math
 import pytest
 from data_preprocessing.preprocessing.scoring import compute_segment_scores_7features
 from data_preprocessing.preprocessing.features import POSE_IDX, matrix_to_euler_deg
+from data_preprocessing.preprocessing.personalization import apply_personalization
 
 
 def _eye(x0, d, y=200):
@@ -138,3 +140,41 @@ def test_looking_down_not_counted_as_closure():
     res = _run(closed, head_pose=hp)                  # 그 3초 동안 15° 숙임 → 아래 응시
     assert [r["raw"]["sleepy_flag"] for r in res] == [0, 0, 0]
     assert all(r["raw"]["perclos_ratio"] == 0.0 for r in res)
+
+
+def _seg(perclos=0.2, head_pose=1.0, status="present", final=0.7, sleepy=0):
+    nan, p = float("nan"), status == "present"
+    return {
+        "scores": {"final": final if p else nan, "head_pose": head_pose if p else nan,
+                   "head_angle": 0.5, "shoulder_tilt": 0.7, "hand_face": 1.0},
+        "raw": {"perclos_ratio": perclos, "blink_rate_proxy": 0.07, "sleepy_flag": sleepy},
+        "flags": {"status": status},
+    }
+
+
+def test_warmup_uses_final():
+    out, _ = apply_personalization([_seg() for _ in range(5)])
+    assert all(o["scores"]["personalized"] == 0.7 for o in out)
+
+
+def test_only_worse_direction_penalized():
+    segs = [_seg() for _ in range(20)] + [_seg(perclos=0.1), _seg(perclos=0.2), _seg(perclos=0.35)]
+    out, summary = apply_personalization(segs)
+    st = [o["scores"]["personal_stability"] for o in out[-3:]]
+    assert st[0] == pytest.approx(1.0) and st[1] == pytest.approx(1.0)   # 좋아지거나 같으면 감점 없음
+    assert st[2] < 0.95                                                   # 평소보다 0.15 악화
+    assert summary["features"]["perclos"]["median"] == 0.2
+
+
+def test_absent_is_nan_and_excluded_from_reference():
+    segs = [_seg() for _ in range(15)] + [_seg(status="absent")] * 5 + [_seg()]
+    out, _ = apply_personalization(segs)
+    assert math.isnan(out[16]["scores"]["personalized"])
+    assert out[-1]["scores"]["personal_stability"] == pytest.approx(1.0)
+
+def test_single_strong_deviation_not_diluted():
+    base = [_seg() for _ in range(20)]
+    hand_drop = _seg()
+    hand_drop["scores"]["hand_face"] = 0.2          # 다른 피처는 모두 평소와 같음
+    out, _ = apply_personalization(base + [hand_drop])
+    assert out[-1]["scores"]["personal_stability"] < 0.6

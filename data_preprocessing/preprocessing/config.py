@@ -113,6 +113,7 @@ BLINK_MIN_SAMPLES = 10      # 세그먼트에 판정 가능 샘플이 이보다 
 # 개인화: 직전 10분 present 세그먼트 대비 나빠진 방향 변화만 감점
 PERSONAL_WINDOW_SEC = 600
 PERSONAL_MIN_SEGMENTS = 12   # 기준 구간에 present 세그먼트가 이보다 적으면(시작 후 약 1분) final 그대로 사용
+PERSONAL_Z_MAX = 4.0   # 피처별 z 상한 (노이즈 하나로 stability가 0에 붙는 것 방지)
 
 # source: scores(0~1 점수, 낮을수록 나쁨) 또는 raw(원시값)
 # floor: 스케일 하한 -> 평소 값이 거의 일정한 피처가 작은 변화에 과민 반응하지 않도록
