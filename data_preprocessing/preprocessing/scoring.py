@@ -244,28 +244,28 @@ def compute_segment_scores_7features(
                     else:
                         hand_face_scores.append(HAND_ABSENT_SCORE)
 
-                    # 4) EAR 기반 깜빡임 / 장시간 감김 (판정 가능한 샘플만)
-                    if eye_eval[t]:
-                        ear = ears[t]
-                        closed = bool(closed_series[t])
-                        if debug and seg_idx < 3:
-                            print(
-                                f"[seg {seg_idx}, t={t}] ear={ear:.4f}, baseline={ear_baseline:.4f}, "
-                                f"threshold={ear_baseline * EYE_CLOSURE_RATIO:.4f}, closed={closed}"
-                            )
+            # 4) EAR 기반 깜빡임 / 장시간 감김 (판정 가능한 샘플만)
+            if eye_eval[t]:
+                ear = ears[t]
+                closed = bool(closed_series[t])
+                if debug and seg_idx < 3:
+                    print(
+                        f"[seg {seg_idx}, t={t}] ear={ear:.4f}, baseline={ear_baseline:.4f}, "
+                        f"threshold={ear_baseline * EYE_CLOSURE_RATIO:.4f}, closed={closed}"
+                    )
 
-                        if prev_closed is not None and prev_closed and not closed:
-                            blink_transitions += 1
-                        prev_closed = closed
+                if prev_closed is not None and prev_closed and not closed:
+                    blink_transitions += 1
+                prev_closed = closed
 
-                        closure_frames = closure_frames + 1 if closed else 0
-                        if closure_frames == closure_long_frames:   # 연속 감김이 기준 길이에 도달한 순간 1회
-                            closure_count += 1
-                    else:
-                        # 판정 불가(숙임·눈 미검출): 눈 상태를 모르므로 연속을 끊음
-                        # (끊지 않으면 숙임 사이의 짧은 감김들이 이어 붙어 장시간 감김이 됨)
-                        prev_closed = None
-                        closure_frames = 0
+                closure_frames = closure_frames + 1 if closed else 0
+                if closure_frames == closure_long_frames:   # 연속 감김이 기준 길이에 도달한 순간 1회
+                    closure_count += 1
+            else:
+                # 판정 불가(숙임·눈 미검출): 눈 상태를 모르므로 연속을 끊음
+                # (끊지 않으면 숙임 사이의 짧은 감김들이 이어 붙어 장시간 감김이 됨)
+                prev_closed = None
+                closure_frames = 0
 
         # -------------------------------
         # 세그먼트 점수
