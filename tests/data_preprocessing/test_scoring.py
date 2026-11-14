@@ -1,10 +1,11 @@
 import numpy as np
-import math
 import pytest
 from data_preprocessing.preprocessing.scoring import compute_segment_scores_7features
-from data_preprocessing.preprocessing.features import POSE_IDX, matrix_to_euler_deg, gaze_h_series, rolling_past_median
+from data_preprocessing.preprocessing.features import (POSE_IDX, matrix_to_euler_deg, gaze_h_series,
+                                                       rolling_past_median, detect_yawn_onsets)
 from data_preprocessing.preprocessing.personalization import apply_personalization
 
+NAN = float("nam")
 
 def _eye(x0, d, y=200):
     return np.array([[x0, y], [x0+10, y-d], [x0+20, y-d],
@@ -197,3 +198,37 @@ def test_rolling_past_median_excludes_current():
     r = rolling_past_median(x, window=10, min_periods=5)
     assert r[-1] == 0.0          # 현재 샘플(1.0)은 기준에 들어가지 않음
     assert np.isnan(r[3])        # min_periods 미만
+
+
+def test_yawn_across_segment_boundary_counted_once():
+    # 세그먼트(25샘플) 경계 20~30에 걸친 2초 하품
+    jaw = np.array([0.0] * 20 + [0.5] * 10 + [0.0] * 20)
+    onset = detect_yawn_onsets(jaw, 0.25, 5, 0.45)
+    assert onset.sum() == 1
+    assert onset[24]                        # 연속 5샘플째(첫 세그먼트 마지막 샘플)에서 확정
+    assert onset[25:].sum() == 0            # 다음 세그먼트에서 다시 세지 않음
+
+
+def test_speaking_short_openings_not_yawn():
+    jaw = np.array([0.5, 0.5, 0.0, 0.0] * 10)   # 0.4초씩 반복해서 열림
+    assert detect_yawn_onsets(jaw, 0.25, 5, 0.45).sum() == 0
+
+
+def test_face_missing_breaks_run():
+    jaw = np.array([0.5] * 3 + [NAN] + [0.5] * 3)
+    assert detect_yawn_onsets(jaw, 0.25, 5, 0.45).sum() == 0
+
+
+def test_long_yawn_counted_once():
+    jaw = np.array([0.5] * 30)                   # 6초 동안 계속
+    assert detect_yawn_onsets(jaw, 0.25, 5, 0.45).sum() == 1
+
+def test_long_but_shallow_opening_not_yawn():
+    jaw = np.array([0.35] * 8)                   # 말하기처럼 1.6초 열렸지만 얕음
+    assert detect_yawn_onsets(jaw, 0.25, 5, 0.45).sum() == 0
+
+
+def test_onset_at_peak_when_peak_comes_late():
+    jaw = np.array([0.3] * 6 + [0.6] + [0.3] * 3)   # 길이 조건은 먼저, peak는 나중에 충족
+    onset = detect_yawn_onsets(jaw, 0.25, 5, 0.45)
+    assert onset.sum() == 1 and onset[6]

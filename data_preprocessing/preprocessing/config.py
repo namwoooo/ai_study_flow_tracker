@@ -130,3 +130,7 @@ PERSONAL_FEATURES = {
     "hand":       {"source": "scores", "key": "hand_face",        "higher_is_worse": False, "floor": 0.15, "weight": 0.15},
     "gaze": {"source": "scores", "key": "gaze", "higher_is_worse": False, "floor": 0.15, "weight": 0.15},
 }
+
+YAWN_JAW_THRESH = 0.25   # 말하기 장면 jawOpen p90 ≈ 0.17, yawn p50 ≈ 0.28
+YAWN_MIN_SEC = 1.0       # 말하기의 짧은 열림과 구분
+YAWN_PEAK_THRESH = 0.45  # 후보 구간의 최댓값

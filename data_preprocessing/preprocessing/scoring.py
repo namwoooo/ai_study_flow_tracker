@@ -23,6 +23,9 @@ from .config import (
     REF_RADIUS_MIN,
     REF_WINDOW_MIN,
     TARGET_FPS,
+    YAWN_MIN_SEC,
+    YAWN_JAW_THRESH,
+    YAWN_PEAK_THRESH,
 )
 from .features import (
     POSE_IDX,
@@ -36,6 +39,8 @@ from .features import (
     weighted_mean,
     gaze_h_series,
     rolling_past_median,
+    blendshape_series,
+    detect_yawn_onsets,
 )
 
 
@@ -147,6 +152,15 @@ def compute_segment_scores_7features(
         gaze_dev = np.abs(gaze_h - gaze_ref)
     else:
         gaze_dev = np.full(len(frame_sizes), np.nan)
+
+    # 하품: jawOpen이 YAWN_MIN_SEC 이상 이어진 순간 (말하기의 짧은 열림과 구분)
+    if blendshapes is not None:
+        jaw_s = blendshape_series(blendshapes, "jawOpen")
+        yawn_onset = detect_yawn_onsets(
+            jaw_s, YAWN_JAW_THRESH, max(1, int(round(YAWN_MIN_SEC * fps))), YAWN_PEAK_THRESH,
+        )
+    else:
+        yawn_onset = np.zeros(T, dtype=bool)
 
     # ------------------------------------------------------------------
     # 세그먼트 루프
@@ -274,7 +288,8 @@ def compute_segment_scores_7features(
             blink_rate_proxy = float("nan")
             blink_score = 0.5
 
-        segment_sleepy = any(sleepy_flags)
+        yawn_count = int(yawn_onset[s:e].sum())
+        segment_sleepy = any(sleepy_flags) or yawn_count > 0
 
         # head pose: 기준 자세(직전 10분 중앙값) 대비 위·좌우 이탈만 감점, 아래(필기)는 제외
         if np.isfinite(ref_p):
@@ -380,6 +395,7 @@ def compute_segment_scores_7features(
                 "body_width_rel": round(body_width_rel, 3),
                 "present_ratio": round(present_ratio, 4),
                 "gaze_away_ratio": round(gaze_away_ratio, 4),
+                "yawn_count": yawn_count,
             },
             "flags": {
                 "seat_departed": status == "absent",

@@ -143,3 +143,33 @@ def shoulder_width(pose_vec, vis_thresh=POSE_VIS_THRESH):
     if pose_vec[l + 3] < vis_thresh or pose_vec[r + 3] < vis_thresh:
         return float("nan")
     return abs(pose_vec[l] - pose_vec[r])
+
+
+def blendshape_series(blendshapes, name):
+    """샘플별 blendshape 값 배열. 얼굴 미검출 샘플은 NaN."""
+    return np.array(
+        [b.get(name, np.nan) if b is not None else np.nan for b in blendshapes],
+        dtype=float,
+    )
+
+
+def detect_yawn_onsets(jaw, thresh, min_frames, peak_thresh):
+    """하품으로 확정되는 샘플에만 True.
+
+    - jaw > thresh가 이어지는 구간에서, 길이 ≥ min_frames 이고 구간 최댓값 ≥ peak_thresh가
+      처음 함께 충족되는 순간 1회 (말하기: 짧거나 얕게 열림 / 하품: 길고 크게 열림)
+    - 길게 이어져도 구간당 1회만, NaN(얼굴 미검출)은 구간을 끊음
+    - 전체 시리즈에서 계산하므로 세그먼트 경계에 걸친 하품도 정확히 1회
+    """
+    onset = np.zeros(len(jaw), dtype=bool)
+    run, peak, counted = 0, 0.0, False
+    for i, v in enumerate(jaw):
+        if np.isfinite(v) and v > thresh:
+            run += 1
+            peak = max(peak, v)
+            if not counted and run >= min_frames and peak >= peak_thresh:
+                onset[i] = True
+                counted = True
+        else:
+            run, peak, counted = 0, 0.0, False
+    return onset
