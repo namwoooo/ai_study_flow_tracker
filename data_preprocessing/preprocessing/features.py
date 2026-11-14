@@ -173,3 +173,26 @@ def detect_yawn_onsets(jaw, thresh, min_frames, peak_thresh):
         else:
             run, peak, counted = 0, 0.0, False
     return onset
+
+
+def detect_nod_events(pitch, drop_deg, drop_frames, recover_deg, recover_frames):
+    """앞으로 급히 숙였다가(pitch +) 곧 다시 드는 동작. 숙인 시점 샘플에 True, 동작당 1회.
+
+    - pitch[i] − pitch[i − drop_frames] > drop_deg 이고
+      이후 recover_frames 안에 recover_deg 이상 다시 들면 고개 떨굼
+    - 숙인 채 머무는 동작(필기)은 회복 조건에서 걸러짐
+    - 회복 확인에 미래 샘플이 필요하므로 실시간에서는 recover_frames만큼 늦게 확정됨
+    """
+    n = len(pitch)
+    out = np.zeros(n, dtype=bool)
+    i = drop_frames
+    while i < n:
+        a, b = pitch[i - drop_frames], pitch[i]
+        if np.isfinite(a) and np.isfinite(b) and b - a > drop_deg:
+            after = pitch[i + 1:i + 1 + recover_frames]
+            if np.isfinite(after).any() and b - np.nanmin(after) > recover_deg:
+                out[i] = True
+                i += drop_frames + recover_frames   # 같은 동작을 중복으로 세지 않음
+                continue
+        i += 1
+    return out

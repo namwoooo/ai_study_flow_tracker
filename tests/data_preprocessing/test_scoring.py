@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from data_preprocessing.preprocessing.scoring import compute_segment_scores_7features
 from data_preprocessing.preprocessing.features import (POSE_IDX, matrix_to_euler_deg, gaze_h_series,
-                                                       rolling_past_median, detect_yawn_onsets)
+                                                       rolling_past_median, detect_yawn_onsets, detect_nod_events)
 from data_preprocessing.preprocessing.personalization import apply_personalization
 
 NAN = float("nam")
@@ -232,3 +232,18 @@ def test_onset_at_peak_when_peak_comes_late():
     jaw = np.array([0.3] * 6 + [0.6] + [0.3] * 3)   # 길이 조건은 먼저, peak는 나중에 충족
     onset = detect_yawn_onsets(jaw, 0.25, 5, 0.45)
     assert onset.sum() == 1 and onset[6]
+
+
+def test_nod_with_recovery_detected_once():
+    pitch = np.array([0.0] * 5 + [6, 12, 20, 20, 10, 2, 0] + [0.0] * 5)
+    assert detect_nod_events(pitch, 16, 3, 8, 10).sum() == 1
+
+
+def test_drop_and_stay_not_nod():
+    pitch = np.array([0.0] * 5 + [6, 12, 20] + [20.0] * 15)       # 필기처럼 숙인 채 유지
+    assert detect_nod_events(pitch, 16, 3, 8, 10).sum() == 0
+
+
+def test_slow_drop_not_nod():
+    pitch = np.array([0.0, 3, 6, 9, 12, 15, 18, 21, 24, 10, 0])  # 0.6초에 9°씩만 숙임
+    assert detect_nod_events(pitch, 16, 3, 8, 10).sum() == 0

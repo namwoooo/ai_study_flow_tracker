@@ -64,8 +64,13 @@ EAR_BASELINE_DEFAULT = 0.25     # baseline 계산 전 기본값
 EAR_BASELINE_MIN_SAMPLES = 30   # compute_EAR_baseline 최소 샘플 수
 EYE_CLOSURE_RATIO = 0.55        # EAR < baseline * ratio 이면 감김
 CLOSURE_LONG_SEC = 2.0          # 이 시간 이상 감김 지속 시 졸음
-HEAD_NOD_THRESH = 0.15          # head nod 판정 각도 변화(rad)
 PERCLOS_WINDOW_SEC = 60         # PERCLOS 계산 창(세그먼트 끝 기준 직전 N초)
+
+# 고개 떨굼(pitch): 급히 숙였다가 곧 다시 드는 동작. 졸음 영상으로 검증 전까지 기록만 함
+NOD_DROP_DEG = 16.0      # NOD_DROP_SEC 동안 아래로 숙인 각도
+NOD_DROP_SEC = 0.6
+NOD_RECOVER_DEG = 8.0    # 이후 NOD_RECOVER_SEC 안에 다시 든 각도
+NOD_RECOVER_SEC = 2.0
 
 # 해당 값 미만의 pose 랜드마크 무시
 POSE_VIS_THRESH = 0.5

@@ -14,7 +14,6 @@ from .config import (
     EYE_CLOSURE_RATIO,
     EYE_GATE_DOWN_DEG,
     HAND_ABSENT_SCORE,
-    HEAD_NOD_THRESH,
     HEAD_REF_WINDOW_SEC,
     PERCLOS_MIN_SAMPLES,
     PERCLOS_WINDOW_SEC,
@@ -26,6 +25,10 @@ from .config import (
     YAWN_MIN_SEC,
     YAWN_JAW_THRESH,
     YAWN_PEAK_THRESH,
+    NOD_DROP_SEC,
+    NOD_DROP_DEG,
+    NOD_RECOVER_SEC,
+    NOD_RECOVER_DEG,
 )
 from .features import (
     POSE_IDX,
@@ -41,6 +44,7 @@ from .features import (
     rolling_past_median,
     blendshape_series,
     detect_yawn_onsets,
+    detect_nod_events,
 )
 
 
@@ -162,6 +166,12 @@ def compute_segment_scores_7features(
     else:
         yawn_onset = np.zeros(T, dtype=bool)
 
+    # 고개 떨굼(pitch): 기록만 하고 sleepy에는 넣지 않음 (졸음 영상으로 검증 전)
+    nod_onset = detect_nod_events(
+        pitch_s, NOD_DROP_DEG, max(1, int(round(NOD_DROP_SEC * fps))),
+        NOD_RECOVER_DEG, max(1, int(round(NOD_RECOVER_SEC * fps))),
+    )
+
     # ------------------------------------------------------------------
     # 세그먼트 루프
     # ------------------------------------------------------------------
@@ -177,6 +187,7 @@ def compute_segment_scores_7features(
         hand_visible_flags = []
         blink_transitions = 0
         sleepy_flags = []
+        closure_hit = False     # 세그먼트 안에서 장시간 감김이 있었는지
 
         for t in range(s, e):
             if frame_sizes[t] is None:
@@ -248,11 +259,8 @@ def compute_segment_scores_7features(
                 closure_frames = closure_frames + 1 if closed else 0
                 closure_long = closure_frames >= closure_long_frames
 
-                head_nod = False
-                if len(head_angles) >= 3:
-                    head_nod = head_angles[-1] - head_angles[-3] > HEAD_NOD_THRESH
-
-                sleepy_flags.append(closure_long or head_nod)
+                sleepy_flags.append(closure_long)
+                closure_hit |= closure_long
 
             elif np.isfinite(ears[t]):
                 # 숙인 상태: 눈 상태를 모르므로 직전 상태를 끊어 숙임↔들기를 깜빡임으로 세지 않음
@@ -289,6 +297,7 @@ def compute_segment_scores_7features(
             blink_score = 0.5
 
         yawn_count = int(yawn_onset[s:e].sum())
+        nod_count = int(nod_onset[s:e].sum())
         segment_sleepy = any(sleepy_flags) or yawn_count > 0
 
         # head pose: 기준 자세(직전 10분 중앙값) 대비 위·좌우 이탈만 감점, 아래(필기)는 제외
@@ -396,6 +405,8 @@ def compute_segment_scores_7features(
                 "present_ratio": round(present_ratio, 4),
                 "gaze_away_ratio": round(gaze_away_ratio, 4),
                 "yawn_count": yawn_count,
+                "sleepy_closure": int(closure_hit),
+                "nod_count": int(nod_count),
             },
             "flags": {
                 "seat_departed": status == "absent",
