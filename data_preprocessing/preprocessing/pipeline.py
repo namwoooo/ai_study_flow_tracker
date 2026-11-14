@@ -16,7 +16,7 @@ CSV_COLUMNS = [
     "usage_ratio", "sleepy_flag", "blink_rate_proxy", "perclos_ratio", "EAR_baseline",
     "seat_departed", "head_pose", "head_yaw_dev", "head_up_dev", "head_down_dev", "status", "face_missing_ratio",
     "body_visible_ratio", "body_width_rel", "eye_eval_ratio", "present_ratio", "gaze", "gaze_away_ratio",
-    "yawn_count", "sleepy_closure", "nod_count"
+    "yawn_count", "closure_count", "nod_count"
 ]
 
 def score_landmarks(lm, target_fps=TARGET_FPS, segment_sec=SEGMENT_SEC, phone_bboxes=None, debug=False):

@@ -187,10 +187,13 @@ def compute_segment_scores_7features(
         hand_visible_flags = []
         blink_transitions = 0
         sleepy_flags = []
-        closure_hit = False     # 세그먼트 안에서 장시간 감김이 있었는지
+        blink_transitions = 0
+        closure_count = 0       # 장시간 감김 횟수 (기록용, 졸음 판정에는 미반영)
 
         for t in range(s, e):
             if frame_sizes[t] is None:
+                closure_frames = 0      # 얼굴 미검출: 감김 연속과 깜빡임 직전 상태를 끊음
+                prev_closed = None
                 continue
             w, h = frame_sizes[t]
             fb = face_bboxes[t]
@@ -241,30 +244,28 @@ def compute_segment_scores_7features(
                     else:
                         hand_face_scores.append(HAND_ABSENT_SCORE)
 
-            # 4) EAR 기반 깜빡임 / 졸음 (숙이지 않은 샘플만)
-            if eye_eval[t]:
-                ear = ears[t]
-                closed = bool(closed_series[t])  # EAR이 baseline의 55% 미만이면 감김
-                if debug and seg_idx < 3:
-                    print(
-                        f"[seg {seg_idx}, t={t}] ear={ear:.4f}, baseline={ear_baseline:.4f}, "
-                        f"threshold={ear_baseline * EYE_CLOSURE_RATIO:.4f}, closed={closed}"
-                    )
+                    # 4) EAR 기반 깜빡임 / 장시간 감김 (판정 가능한 샘플만)
+                    if eye_eval[t]:
+                        ear = ears[t]
+                        closed = bool(closed_series[t])
+                        if debug and seg_idx < 3:
+                            print(
+                                f"[seg {seg_idx}, t={t}] ear={ear:.4f}, baseline={ear_baseline:.4f}, "
+                                f"threshold={ear_baseline * EYE_CLOSURE_RATIO:.4f}, closed={closed}"
+                            )
 
-                # 감김 → 뜸 전환 = 깜빡임 1회
-                if prev_closed is not None and prev_closed and not closed:
-                    blink_transitions += 1
-                prev_closed = closed
+                        if prev_closed is not None and prev_closed and not closed:
+                            blink_transitions += 1
+                        prev_closed = closed
 
-                closure_frames = closure_frames + 1 if closed else 0
-                closure_long = closure_frames >= closure_long_frames
-
-                sleepy_flags.append(closure_long)
-                closure_hit |= closure_long
-
-            elif np.isfinite(ears[t]):
-                # 숙인 상태: 눈 상태를 모르므로 직전 상태를 끊어 숙임↔들기를 깜빡임으로 세지 않음
-                prev_closed = None
+                        closure_frames = closure_frames + 1 if closed else 0
+                        if closure_frames == closure_long_frames:   # 연속 감김이 기준 길이에 도달한 순간 1회
+                            closure_count += 1
+                    else:
+                        # 판정 불가(숙임·눈 미검출): 눈 상태를 모르므로 연속을 끊음
+                        # (끊지 않으면 숙임 사이의 짧은 감김들이 이어 붙어 장시간 감김이 됨)
+                        prev_closed = None
+                        closure_frames = 0
 
         # -------------------------------
         # 세그먼트 점수
@@ -298,7 +299,9 @@ def compute_segment_scores_7features(
 
         yawn_count = int(yawn_onset[s:e].sum())
         nod_count = int(nod_onset[s:e].sum())
-        segment_sleepy = any(sleepy_flags) or yawn_count > 0
+        # 졸음 신호: 검증된 하품만. 장시간 감김·고개 떨굼은 정면 구도에서 책 보기와
+        # 구분되지 않아 기록만 함 (실제 졸음에 따른 감김 증가는 개인화 PERCLOS가 반영)
+        segment_sleepy = yawn_count > 0
 
         # head pose: 기준 자세(직전 10분 중앙값) 대비 위·좌우 이탈만 감점, 아래(필기)는 제외
         if np.isfinite(ref_p):
@@ -405,7 +408,7 @@ def compute_segment_scores_7features(
                 "present_ratio": round(present_ratio, 4),
                 "gaze_away_ratio": round(gaze_away_ratio, 4),
                 "yawn_count": yawn_count,
-                "sleepy_closure": int(closure_hit),
+                "closure_count": int(closure_count),
                 "nod_count": int(nod_count),
             },
             "flags": {

@@ -5,19 +5,20 @@ from data_preprocessing.preprocessing.features import (POSE_IDX, matrix_to_euler
                                                        rolling_past_median, detect_yawn_onsets, detect_nod_events)
 from data_preprocessing.preprocessing.personalization import apply_personalization
 
-NAN = float("nam")
+NAN = float("nan")
 
 def _eye(x0, d, y=200):
     return np.array([[x0, y], [x0+10, y-d], [x0+20, y-d],
                      [x0+30, y], [x0+20, y+d], [x0+10, y+d]], dtype=np.float32)
 
 
-def _run(closed_idx, n=75, d_open=4.5, d_closed=0.75, head_pose=None):
+def _run(closed_idx, n=75, d_open=4.5, d_closed=0.75, head_pose=None, frame_sizes=None):
     eyes = [(_eye(250, d_closed if t in closed_idx else d_open),
              _eye(330, d_closed if t in closed_idx else d_open)) for t in range(n)]
     return compute_segment_scores_7features(
         processed_frames=[True] * n, pose_keypoints=[None] * n, eyes_landmarks=eyes,
-        face_bboxes=[(200, 100, 400, 350)] * n, frame_sizes=[(640, 480)] * n,
+        face_bboxes=[(200, 100, 400, 350)] * n,
+        frame_sizes=frame_sizes or [(640, 480)] * n,
         segment_size=25, fps=5, head_pose=head_pose,
     )
 
@@ -33,12 +34,23 @@ def test_blink_in_first_segment_uses_personal_baseline():
 
 def test_closure_long_across_segment_boundary():
     res = _run(set(range(20, 32)))  # 2.4초, seg0→seg1 경계
-    assert [r["raw"]["sleepy_flag"] for r in res] == [0, 1, 0]
-
-
-def test_short_blinks_not_sleepy():
-    res = _run({10, 30, 31, 55})    # 0.2~0.4초 깜빡임만
+    # 연속 10샘플(2초)째인 t=29(seg1)에서 1회 확정
+    assert [r["raw"]["closure_count"] for r in res] == [0, 1, 0]
+    # 장시간 감김은 기록만 하고 졸음 판정에는 넣지 않음
     assert [r["raw"]["sleepy_flag"] for r in res] == [0, 0, 0]
+
+
+def test_short_blinks_not_closure():
+    res = _run({10, 30, 31, 55})    # 0.2~0.4초 깜빡임만
+    assert [r["raw"]["closure_count"] for r in res] == [0, 0, 0]
+
+
+def test_looking_down_not_counted_as_closure():
+    closed = set(range(30, 45))                       # seg1에서 3초간 "감김"처럼 보임
+    hp = [(15.0, 0.0, 0.0) if t in closed else (0.0, 0.0, 0.0) for t in range(75)]
+    res = _run(closed, head_pose=hp)                  # 그 3초 동안 15° 숙임 → 아래 응시
+    assert [r["raw"]["closure_count"] for r in res] == [0, 0, 0]
+    assert all(r["raw"]["perclos_ratio"] == 0.0 for r in res)
 
 
 def test_perclos_ratio_uses_trailing_window():
@@ -247,3 +259,19 @@ def test_drop_and_stay_not_nod():
 def test_slow_drop_not_nod():
     pitch = np.array([0.0, 3, 6, 9, 12, 15, 18, 21, 24, 10, 0])  # 0.6초에 9°씩만 숙임
     assert detect_nod_events(pitch, 16, 3, 8, 10).sum() == 0
+
+
+def test_closure_run_broken_by_head_down():
+    # 감김 1초 → 숙임(판정 불가) 1초 → 감김 1초: 2초 연속 감김이 아님
+    closed = set(range(20, 25)) | set(range(30, 35))
+    hp = [(15.0, 0.0, 0.0) if 25 <= t < 30 else (0.0, 0.0, 0.0) for t in range(75)]
+    res = _run(closed, head_pose=hp)
+    assert sum(r["raw"]["closure_count"] for r in res) == 0
+
+
+def test_closure_run_broken_by_face_missing():
+    # 감김 1초 → 얼굴 미검출 1초 → 감김 1초
+    closed = set(range(20, 25)) | set(range(30, 35))
+    sizes = [None if 25 <= t < 30 else (640, 480) for t in range(75)]
+    res = _run(closed, frame_sizes=sizes)
+    assert sum(r["raw"]["closure_count"] for r in res) == 0
